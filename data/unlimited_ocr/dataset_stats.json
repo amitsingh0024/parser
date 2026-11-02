@@ -1,0 +1,11 @@
+{
+  "total_documents": 250,
+  "train_documents": 225,
+  "val_documents": 25,
+  "hf_raw_sanskrit_samples": 200,
+  "hf_raw_devanagari_samples": 200,
+  "multi_page_documents": 30,
+  "single_page_documents": 220,
+  "train_jsonl": "data/unlimited_ocr/train.jsonl",
+  "val_jsonl": "data/unlimited_ocr/val.jsonl"
+}
