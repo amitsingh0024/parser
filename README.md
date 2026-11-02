@@ -151,6 +151,24 @@ This extracts page images (`data/custom_pdfs/images/*.jpg`), normalizes bounding
   --logging-steps 1
 ```
 
+#### B. Resuming Training from a Checkpoint
+If you stop training (e.g. `Ctrl+C`) or your machine reboots, you can resume seamlessly from the latest saved checkpoint (or any specific checkpoint folder):
+```powershell
+# Automatically find and resume from the latest checkpoint in --output-dir:
+.\.venv\Scripts\python.exe train.py `
+  --train-data data/unlimited_ocr/train.jsonl `
+  --eval-data data/unlimited_ocr/val.jsonl `
+  --output-dir outputs/unlimited-ocr2-indic-lora `
+  --resume-from-checkpoint latest
+
+# Or specify an exact checkpoint folder:
+.\.venv\Scripts\python.exe train.py `
+  --train-data data/unlimited_ocr/train.jsonl `
+  --eval-data data/unlimited_ocr/val.jsonl `
+  --output-dir outputs/unlimited-ocr2-indic-lora `
+  --resume-from-checkpoint outputs/unlimited-ocr2-indic-lora/checkpoint-100
+```
+
 #### B. Live Progress Bar & Monitoring
 During training, `train.py` displays:
 1. **Dataset loading progress bar** (`doc/s`) when reading `train.jsonl` and `val.jsonl`.

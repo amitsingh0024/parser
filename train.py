@@ -434,6 +434,12 @@ def main():
     parser.add_argument("--max-steps", type=int, default=-1, help="If > 0, override epochs and stop after N steps")
     parser.add_argument("--save-steps", type=int, default=50, help="Save checkpoint every N steps")
     parser.add_argument("--logging-steps", type=int, default=1, help="Update progress bar metrics every N steps")
+    parser.add_argument(
+        "--resume-from-checkpoint",
+        type=str,
+        default=None,
+        help="Path to checkpoint directory or 'latest' / 'true' to resume training",
+    )
     args = parser.parse_args()
 
     model, tokenizer = build_model_and_tokenizer(args)
@@ -475,8 +481,15 @@ def main():
         callbacks=[LiveTrainingProgressCallback(output_dir=args.output_dir)],
     )
 
-    print("[INFO] Starting training with live tqdm progress bar...")
-    trainer.train()
+    resume_ckpt = args.resume_from_checkpoint
+    if resume_ckpt and resume_ckpt.lower() in ("true", "1", "latest"):
+        resume_ckpt = True
+
+    if resume_ckpt:
+        print(f"[INFO] Resuming training from checkpoint: {resume_ckpt}...")
+    else:
+        print("[INFO] Starting training with live tqdm progress bar...")
+    trainer.train(resume_from_checkpoint=resume_ckpt)
 
     print(f"[INFO] Saving LoRA adapter & tokenizer to {args.output_dir}...")
     model.save_pretrained(args.output_dir)
