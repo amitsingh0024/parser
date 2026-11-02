@@ -316,17 +316,9 @@ class DataCollatorForUnlimitedOCR:
         )
         attention_mask = input_ids_padded.ne(self.pad_token_id).long()
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        images_batch: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
-        for f in features:
-            crop_t, ori_t, spatial_t = f["image_tuple"]
-            images_batch.append(
-                (
-                    crop_t.to(device, non_blocking=True),
-                    ori_t.to(device, non_blocking=True),
-                    spatial_t.to(device, non_blocking=True),
-                )
-            )
+        images_batch: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = [
+            f["image_tuple"] for f in features
+        ]
 
         return {
             "input_ids": input_ids_padded,
@@ -394,6 +386,14 @@ def build_model_and_tokenizer(args: argparse.Namespace):
     elif args.gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
         model.gradient_checkpointing_enable()
 
+    # Clone input embeddings so UnlimitedOCRModel's in-place `inputs_embeds[idx].masked_scatter_()`
+    # operates on a non-leaf tensor (avoids PyTorch leaf-variable in-place RuntimeError).
+    input_emb = model.get_input_embeddings()
+    if input_emb is not None:
+        input_emb.register_forward_hook(
+            lambda _module, _inp, out: out.requires_grad_(True).clone()
+        )
+
     target_modules = [m.strip() for m in args.lora_target_modules.split(",") if m.strip()]
     lora_config = LoraConfig(
         r=args.lora_r,
@@ -431,6 +431,7 @@ def main():
     parser.add_argument("--grad-accum", type=int, default=8, help="Gradient accumulation steps")
     parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate")
     parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs")
+    parser.add_argument("--max-steps", type=int, default=-1, help="If > 0, override epochs and stop after N steps")
     parser.add_argument("--save-steps", type=int, default=50, help="Save checkpoint every N steps")
     parser.add_argument("--logging-steps", type=int, default=1, help="Update progress bar metrics every N steps")
     args = parser.parse_args()
@@ -449,6 +450,7 @@ def main():
         gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.lr,
         num_train_epochs=args.epochs,
+        max_steps=args.max_steps,
         bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
         fp16=torch.cuda.is_available() and not torch.cuda.is_bf16_supported(),
         optim="paged_adamw_8bit" if args.use_4bit else "adamw_torch",
@@ -458,6 +460,8 @@ def main():
         save_total_limit=2,
         gradient_checkpointing=args.gradient_checkpointing,
         remove_unused_columns=False,
+        dataloader_pin_memory=False,
+        label_names=["labels"],
         disable_tqdm=True,  # Handled by LiveTrainingProgressCallback with VRAM + loss + ETA
         report_to="none",
     )
