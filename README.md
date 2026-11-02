@@ -67,13 +67,15 @@ baidu-parser/
 │   └── README.md                             # Post-processing & layout block specification
 └── data/
     ├── sample_train.jsonl                    # Minimal 2-sample reference JSONL
-    ├── raw_hf/                               # Downloaded Hugging Face Sanskrit & Devanagari OCR datasets
+    ├── raw_hf/                               # Downloaded Hugging Face Sanskrit, Devanagari & English OCR datasets (1,350 samples)
     │   ├── Process-Venue__Sanskrit-OCR-Typed-Dataset/
-    │   └── Malathip72__devanagari-ocr-dataset/
-    └── unlimited_ocr/                        # Ready-to-train Unlimited-OCR-2 dataset (250 documents)
-        ├── images/                           # Full-page composite & structured trilingual page renders
-        ├── train.jsonl                       # 225 training documents (single-page & multi-page)
-        ├── val.jsonl                         # 25 validation documents
+    │   ├── Malathip72__devanagari-ocr-dataset/
+    │   ├── Srijan-Chakraborty__OCR-Finetuning-EN-Dataset/
+    │   └── TheFinAI__en-ocr/
+    └── unlimited_ocr/                        # Ready-to-train Unlimited-OCR-2 dataset (1,000 documents)
+        ├── images/                           # 700 HF composite pages + 300 structured trilingual page renders
+        ├── train.jsonl                       # 900 training documents (single-page & multi-page)
+        ├── val.jsonl                         # 100 validation documents
         └── dataset_stats.json                # Dataset summary counts
 ```
 

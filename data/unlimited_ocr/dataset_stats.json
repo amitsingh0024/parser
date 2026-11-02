@@ -1,11 +1,14 @@
 {
-  "total_documents": 250,
-  "train_documents": 225,
-  "val_documents": 25,
-  "hf_raw_sanskrit_samples": 200,
-  "hf_raw_devanagari_samples": 200,
-  "multi_page_documents": 30,
-  "single_page_documents": 220,
+  "total_documents": 1000,
+  "train_documents": 900,
+  "val_documents": 100,
+  "hf_raw_sanskrit_samples": 450,
+  "hf_raw_devanagari_samples": 450,
+  "hf_raw_english_samples": 450,
+  "hf_composite_pages": 700,
+  "structured_trilingual_documents": 300,
+  "multi_page_documents": 80,
+  "single_page_documents": 920,
   "train_jsonl": "data/unlimited_ocr/train.jsonl",
   "val_jsonl": "data/unlimited_ocr/val.jsonl"
 }

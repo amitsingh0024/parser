@@ -4,17 +4,22 @@ Download & Prepare Hindi, Sanskrit, and English OCR Datasets for Baidu Unlimited
 
 This script:
 1. Downloads public Sanskrit, Hindi (Devanagari), and English OCR datasets from Hugging Face
-   and saves them into `data/raw_hf/`.
-2. Converts real cropped OCR images into:
-   - Single-image OCR training samples
-   - Full-page composite document layouts with exact [x1, y1, x2, y2] (0-1000 normalized)
-     bounding boxes in Unlimited-OCR-2 `<PAGE><BLOCK>...<FORK>` format.
-3. Synthesizes rich single-page and multi-page structured documents (titles, paragraphs,
-   bilingual/trilingual tables, cross-page text continuations) in Hindi, Sanskrit, and English
+   and saves them into `data/raw_hf/`:
+   - Sanskrit: `Process-Venue/Sanskrit-OCR-Typed-Dataset`
+   - Hindi / Devanagari: `Malathip72/devanagari-ocr-dataset`, `AbhishekBhandari/Devanagari-OCR-ICL-Benchmark`
+   - English: `Srijan-Chakraborty/OCR-Finetuning-EN-Dataset`, `TheFinAI/en-ocr`
+2. Converts real cropped/page OCR images from Hugging Face into:
+   - Full-page Sanskrit composite document layouts (`150` pages)
+   - Full-page Hindi/Devanagari composite document layouts (`200` pages)
+   - Full-page English composite/document layouts (`200` pages)
+   - Full-page Mixed Trilingual (English + Hindi + Sanskrit real HF crops on the same page, `150` pages)
+   with exact [x1, y1, x2, y2] (0-1000 normalized) bounding boxes in Unlimited-OCR-2 `<PAGE><BLOCK>...<FORK>` format.
+3. Synthesizes rich single-page (`220`) and multi-page (`80`) structured documents (titles, paragraphs,
+   bilingual/trilingual HTML tables, cross-page text continuations) in Hindi, Sanskrit, and English
    using PyMuPDF's HarfBuzz shaper (`Nirmala.ttc`) with exact normalized bounding boxes.
-4. Verifies all generated annotations with `utils/process_unlimitedOCR2.py` and writes:
-   - `data/unlimited_ocr/train.jsonl`
-   - `data/unlimited_ocr/val.jsonl`
+4. Verifies all 1,000 generated document annotations with `utils/process_unlimitedOCR2.py` and writes:
+   - `data/unlimited_ocr/train.jsonl` (~900 docs)
+   - `data/unlimited_ocr/val.jsonl` (~100 docs)
    - `data/unlimited_ocr/dataset_stats.json`
 """
 
@@ -29,7 +34,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pymupdf
 from datasets import load_dataset
-from PIL import Image, ImageDraw, ImageOps
+from PIL import Image, ImageDraw
 from tqdm.auto import tqdm
 
 # Ensure project root is importable
@@ -132,7 +137,7 @@ def norm_bbox(x0: float, y0: float, x1: float, y1: float, w: float, h: float) ->
 def extract_pil_and_text(row: Dict[str, Any]) -> Tuple[Optional[Image.Image], Optional[str]]:
     """Extract PIL image and text label from a HuggingFace dataset row."""
     img = None
-    for k in ("image", "img", "file", "page"):
+    for k in ("image", "img", "file", "page", "pixel_values"):
         if k in row and row[k] is not None:
             val = row[k]
             if isinstance(val, Image.Image):
@@ -145,28 +150,52 @@ def extract_pil_and_text(row: Dict[str, Any]) -> Tuple[Optional[Image.Image], Op
                 img = Image.open(val["path"]).convert("RGB")
                 break
 
+    if img is None:
+        # Fallback: scan all values for an Image
+        for val in row.values():
+            if isinstance(val, Image.Image):
+                img = val.convert("RGB")
+                break
+            elif isinstance(val, dict) and "bytes" in val and val["bytes"]:
+                try:
+                    img = Image.open(io.BytesIO(val["bytes"])).convert("RGB")
+                    break
+                except Exception:
+                    pass
+
     txt = None
-    for k in ("text", "label", "transcription", "ground_truth", "sentence", "ocr"):
+    for k in ("text", "label", "transcription", "ground_truth", "sentence", "ocr", "answer", "gt", "output", "markdown"):
         if k in row and isinstance(row[k], str) and row[k].strip():
             txt = row[k].strip()
             break
+
+    if txt is None:
+        for k, val in row.items():
+            if k not in ("id", "file_name", "image_path", "split") and isinstance(val, str) and len(val.strip()) > 1:
+                txt = val.strip()
+                break
+
     return img, txt
 
 
-def download_hf_ocr_datasets(raw_hf_dir: Path, max_per_dataset: int = 400) -> Dict[str, List[Tuple[Image.Image, str]]]:
+def download_hf_ocr_datasets(raw_hf_dir: Path, max_per_dataset: int = 500) -> Dict[str, List[Tuple[Image.Image, str]]]:
     """
-    Download public Sanskrit & Devanagari/Hindi OCR datasets from Hugging Face
+    Download public Sanskrit, Hindi (Devanagari), and English OCR datasets from Hugging Face
     and save raw copies under `data/raw_hf/`.
     """
     raw_hf_dir.mkdir(parents=True, exist_ok=True)
     collected: Dict[str, List[Tuple[Image.Image, str]]] = {
         "sanskrit": [],
         "devanagari": [],
+        "english": [],
     }
 
     candidates = [
         ("sanskrit", "Process-Venue/Sanskrit-OCR-Typed-Dataset", "train"),
         ("devanagari", "Malathip72/devanagari-ocr-dataset", "train"),
+        ("devanagari", "AbhishekBhandari/Devanagari-OCR-ICL-Benchmark", "train"),
+        ("english", "Srijan-Chakraborty/OCR-Finetuning-EN-Dataset", "train"),
+        ("english", "TheFinAI/en-ocr", "test"),
     ]
 
     for category, repo_id, split in candidates:
@@ -177,28 +206,30 @@ def download_hf_ocr_datasets(raw_hf_dir: Path, max_per_dataset: int = 400) -> Di
         img_dir = save_dir / "images"
         img_dir.mkdir(parents=True, exist_ok=True)
 
-        # Reuse cached samples on disk if already downloaded
+        existing_items: List[Dict[str, Any]] = []
         if jsonl_meta.exists() and jsonl_meta.stat().st_size > 0:
-            loaded = 0
             with open(jsonl_meta, "r", encoding="utf-8") as mf:
                 for line in mf:
-                    if not line.strip():
-                        continue
-                    item = json.loads(line)
-                    img_p = raw_hf_dir / item["image"]
-                    if img_p.exists():
-                        collected[category].append((Image.open(img_p).convert("RGB"), item["text"]))
-                        loaded += 1
+                    if line.strip():
+                        existing_items.append(json.loads(line))
+
+        if len(existing_items) >= max_per_dataset:
+            loaded = 0
+            for item in existing_items[:max_per_dataset]:
+                img_p = raw_hf_dir / item["image"]
+                if img_p.exists():
+                    collected[category].append((Image.open(img_p).convert("RGB"), item["text"]))
+                    loaded += 1
             if loaded > 0:
                 print(f"[HF] Loaded {loaded} cached samples from {save_dir}")
                 continue
 
-        print(f"[HF] Fetching {repo_id} ({split})...")
+        print(f"[HF] Fetching {repo_id} ({split}) up to {max_per_dataset} samples...")
         try:
             ds = load_dataset(repo_id, split=split, streaming=True)
             count = 0
             with open(jsonl_meta, "w", encoding="utf-8") as mf:
-                for idx, row in enumerate(ds):
+                for row in tqdm(ds, total=max_per_dataset, desc=f"Downloading {repo_id}", unit="sample"):
                     if count >= max_per_dataset:
                         break
                     img, txt = extract_pil_and_text(row)
@@ -217,7 +248,14 @@ def download_hf_ocr_datasets(raw_hf_dir: Path, max_per_dataset: int = 400) -> Di
                     count += 1
             print(f"[HF] Saved {count} real OCR samples from {repo_id} -> {save_dir}")
         except Exception as e:
-            print(f"[WARN] Could not stream {repo_id}: {e}")
+            print(f"[WARN] Could not stream {repo_id} ({split}): {e}")
+            # If we had partial existing items on disk, load them
+            if existing_items:
+                for item in existing_items:
+                    img_p = raw_hf_dir / item["image"]
+                    if img_p.exists():
+                        collected[category].append((Image.open(img_p).convert("RGB"), item["text"]))
+                print(f"[HF] Fallback: loaded {len(existing_items)} cached samples from {save_dir}")
 
     return collected
 
@@ -226,7 +264,8 @@ def build_composite_pages_from_hf(
     hf_samples: List[Tuple[Image.Image, str]],
     out_img_dir: Path,
     prefix: str,
-    num_pages: int = 80,
+    num_pages: int,
+    languages: List[str],
 ) -> List[Dict[str, Any]]:
     """
     Compose multiple real cropped OCR line/block images from Hugging Face datasets
@@ -242,7 +281,6 @@ def build_composite_pages_from_hf(
 
     for p_idx in tqdm(range(num_pages), desc=f"Building {prefix} composite pages", unit="page"):
         canvas = Image.new("RGB", (page_w, page_h), color=(252, 251, 248))
-        draw = ImageDraw.Draw(canvas)
         y_cursor = 70
         margin_x = 70
         max_block_w = page_w - 2 * margin_x
@@ -255,8 +293,10 @@ def build_composite_pages_from_hf(
             cw, ch = crop_img.size
             if cw <= 0 or ch <= 0:
                 continue
-            scale = min(max_block_w / cw, 110.0 / max(ch, 1))
-            scale = max(0.5, min(scale, 2.2))
+            # If the HF image is already a full page (aspect ratio > 0.65 and ch > 500), allow taller block
+            max_h_target = 360.0 if (ch > 300 and cw > 300) else 110.0
+            scale = min(max_block_w / cw, max_h_target / max(ch, 1))
+            scale = max(0.35, min(scale, 2.2))
             new_w = max(40, min(max_block_w, int(cw * scale)))
             new_h = max(24, int(ch * scale))
 
@@ -299,7 +339,7 @@ def build_composite_pages_from_hf(
                 "prompt": "<PAGE><image>Multi page parsing.",
                 "response": response,
                 "source": f"hf_composite_{prefix}",
-                "languages": ["sa", "hi"],
+                "languages": languages,
             }
         )
 
@@ -380,8 +420,8 @@ def render_structured_page_pymupdf(
 
 def generate_trilingual_documents(
     out_img_dir: Path,
-    num_single_page: int = 90,
-    num_multi_page: int = 25,
+    num_single_page: int = 220,
+    num_multi_page: int = 80,
 ) -> List[Dict[str, Any]]:
     """
     Generate single-page and multi-page Hindi + Sanskrit + English structured documents
@@ -413,6 +453,8 @@ def generate_trilingual_documents(
             blocks_spec.append({"type": "title", "level": 1, "content": random.choice(ENGLISH_TITLES)})
             for _ in range(random.randint(2, 3)):
                 blocks_spec.append({"type": "text", "content": random.choice(ENGLISH_PARAGRAPHS)})
+            if random.random() < 0.45:
+                blocks_spec.append({"type": "table", "content": random.choice(TABLE_SAMPLES)})
             langs = ["en"]
         else:
             blocks_spec.append({"type": "title", "level": 1, "content": random.choice(HINDI_TITLES)})
@@ -448,7 +490,6 @@ def generate_trilingual_documents(
             if p == 0:
                 blocks_spec.append({"type": "title", "level": 1, "content": random.choice(SANSKRIT_TITLES)})
             else:
-                # Continuation from previous page's cross_text
                 cont_pool = HINDI_PARAGRAPHS if m_idx % 2 == 0 else SANSKRIT_PARAGRAPHS
                 blocks_spec.append({"type": "append_text", "content": random.choice(cont_pool)})
                 blocks_spec.append({"type": "title", "level": 2, "content": random.choice(HINDI_TITLES)})
@@ -459,7 +500,6 @@ def generate_trilingual_documents(
             blocks_spec.append({"type": "text", "content": random.choice(ENGLISH_PARAGRAPHS)})
 
             if p < n_pages - 1:
-                # Cross-page paragraph at the bottom of page p
                 lead_pool = HINDI_PARAGRAPHS if m_idx % 2 == 0 else SANSKRIT_PARAGRAPHS
                 blocks_spec.append({"type": "cross_text", "content": random.choice(lead_pool)})
 
@@ -487,7 +527,7 @@ def generate_trilingual_documents(
 def main():
     parser = argparse.ArgumentParser(description="Download and build Hindi, Sanskrit, and English Unlimited-OCR-2 datasets")
     parser.add_argument("--data-dir", default=str(ROOT_DIR / "data"), help="Base data directory")
-    parser.add_argument("--hf-max-samples", type=int, default=300, help="Max samples to pull per Hugging Face dataset")
+    parser.add_argument("--hf-max-samples", type=int, default=450, help="Max samples to pull per Hugging Face dataset")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -499,7 +539,7 @@ def main():
     uocr_dir.mkdir(parents=True, exist_ok=True)
     uocr_img_dir.mkdir(parents=True, exist_ok=True)
 
-    # Step 1: Download real Sanskrit & Devanagari/Hindi OCR datasets from Hugging Face
+    # Step 1: Download real Sanskrit, Hindi/Devanagari & English OCR datasets from Hugging Face
     hf_collected = download_hf_ocr_datasets(raw_hf_dir, max_per_dataset=args.hf_max_samples)
 
     all_records: List[Dict[str, Any]] = []
@@ -507,23 +547,39 @@ def main():
     # Step 2: Build composite full-page Unlimited-OCR-2 samples from real HF datasets
     if hf_collected["sanskrit"]:
         sa_records = build_composite_pages_from_hf(
-            hf_collected["sanskrit"], uocr_img_dir / "hf_sanskrit", "sanskrit", num_pages=60
+            hf_collected["sanskrit"], uocr_img_dir / "hf_sanskrit", "sanskrit", num_pages=150, languages=["sa"]
         )
         all_records.extend(sa_records)
         print(f"[BUILD] Created {len(sa_records)} full-page Sanskrit OCR composite pages from HF data.")
 
     if hf_collected["devanagari"]:
         dev_records = build_composite_pages_from_hf(
-            hf_collected["devanagari"], uocr_img_dir / "hf_devanagari", "devanagari", num_pages=60
+            hf_collected["devanagari"], uocr_img_dir / "hf_devanagari", "devanagari", num_pages=200, languages=["hi", "sa"]
         )
         all_records.extend(dev_records)
         print(f"[BUILD] Created {len(dev_records)} full-page Hindi/Devanagari OCR composite pages from HF data.")
 
-    # Step 3: Build structured single-page and multi-page Hindi + Sanskrit + English documents
+    if hf_collected["english"]:
+        en_records = build_composite_pages_from_hf(
+            hf_collected["english"], uocr_img_dir / "hf_english", "english", num_pages=200, languages=["en"]
+        )
+        all_records.extend(en_records)
+        print(f"[BUILD] Created {len(en_records)} full-page English OCR composite pages from HF data.")
+
+    # Step 3: Build Mixed Trilingual HF Composite pages (combining real English + Hindi + Sanskrit HF crops on the same page)
+    mixed_pool = hf_collected["sanskrit"] + hf_collected["devanagari"] + hf_collected["english"]
+    if mixed_pool:
+        mixed_records = build_composite_pages_from_hf(
+            mixed_pool, uocr_img_dir / "hf_mixed_trilingual", "mixed_trilingual", num_pages=150, languages=["en", "hi", "sa"]
+        )
+        all_records.extend(mixed_records)
+        print(f"[BUILD] Created {len(mixed_records)} full-page Mixed Trilingual (EN+HI+SA) HF composite pages.")
+
+    # Step 4: Build structured single-page and multi-page Hindi + Sanskrit + English documents
     structured_records = generate_trilingual_documents(
         uocr_img_dir / "trilingual_docs",
-        num_single_page=100,
-        num_multi_page=30,
+        num_single_page=220,
+        num_multi_page=80,
     )
     all_records.extend(structured_records)
     print(f"[BUILD] Created {len(structured_records)} structured Hindi/Sanskrit/English single & multi-page documents.")
@@ -535,7 +591,7 @@ def main():
         ]
 
     random.shuffle(all_records)
-    val_size = max(10, int(len(all_records) * 0.1))
+    val_size = max(25, int(len(all_records) * 0.1))
     val_records = all_records[:val_size]
     train_records = all_records[val_size:]
 
@@ -556,6 +612,9 @@ def main():
         "val_documents": len(val_records),
         "hf_raw_sanskrit_samples": len(hf_collected["sanskrit"]),
         "hf_raw_devanagari_samples": len(hf_collected["devanagari"]),
+        "hf_raw_english_samples": len(hf_collected["english"]),
+        "hf_composite_pages": len(all_records) - len(structured_records),
+        "structured_trilingual_documents": len(structured_records),
         "multi_page_documents": sum(1 for r in all_records if len(r["images"]) > 1),
         "single_page_documents": sum(1 for r in all_records if len(r["images"]) == 1),
         "train_jsonl": str(train_jsonl.relative_to(ROOT_DIR)).replace("\\", "/"),
