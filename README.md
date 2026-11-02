@@ -44,6 +44,174 @@
 
 </div>
 
+---
+
+## Local Training & Inference Guide (Hindi, Sanskrit & English — Windows / 6 GB VRAM)
+
+This repository is configured to fine-tune and run **Baidu Unlimited-OCR-2** (`baidu/Unlimited-OCR-2`, 3B parameters) locally on a consumer Windows GPU (e.g., **NVIDIA GeForce RTX 4050 6 GB VRAM**) using **4-bit NF4 QLoRA**, with datasets and pipelines built for **Hindi, Sanskrit (Devanagari), and English** documents.
+
+### 1. Project Structure
+
+```text
+baidu-parser/
+├── .venv/                                    # Local Python 3.11 + CUDA 12.8 virtual environment
+├── requirements.txt                          # Pinned dependencies for Unlimited-OCR-2 + QLoRA
+├── train.py                                  # Single-GPU 4-bit QLoRA training script with live tqdm progress bar
+├── local_infer.py                            # Local Windows Transformers inference (images, PDFs, LoRA adapters)
+├── infer.py                                  # Upstream batch SGLang client for MPDocBench / MarathonDocBench
+├── scripts/
+│   ├── download_and_prepare_datasets.py      # Downloads HF Sanskrit/Devanagari datasets & builds trilingual pages
+│   └── pdf_to_dataset.py                     # Converts custom digital PDFs into Unlimited-OCR-2 training JSONL
+├── utils/
+│   ├── process_unlimitedOCR2.py              # Converts raw <PAGE><BLOCK>...<FORK> output to clean Markdown
+│   └── README.md                             # Post-processing & layout block specification
+└── data/
+    ├── sample_train.jsonl                    # Minimal 2-sample reference JSONL
+    ├── raw_hf/                               # Downloaded Hugging Face Sanskrit & Devanagari OCR datasets
+    │   ├── Process-Venue__Sanskrit-OCR-Typed-Dataset/
+    │   └── Malathip72__devanagari-ocr-dataset/
+    └── unlimited_ocr/                        # Ready-to-train Unlimited-OCR-2 dataset (250 documents)
+        ├── images/                           # Full-page composite & structured trilingual page renders
+        ├── train.jsonl                       # 225 training documents (single-page & multi-page)
+        ├── val.jsonl                         # 25 validation documents
+        └── dataset_stats.json                # Dataset summary counts
+```
+
+---
+
+### 2. Environment Setup
+
+If setting up from scratch on Windows (PowerShell):
+
+```powershell
+# 1. Create and activate the virtual environment
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+
+# 2. Install CUDA-enabled PyTorch (CUDA 12.8)
+.\.venv\Scripts\python.exe -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+
+# 3. Install project & QLoRA dependencies
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+
+# 4. Verify GPU detection
+.\.venv\Scripts\python.exe -c "import torch; print('CUDA:', torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+```
+
+---
+
+### 3. Dataset Format & Preparation (Hindi, Sanskrit & English)
+
+#### A. Unlimited-OCR-2 Ground-Truth Schema
+Each line in `train.jsonl` / `val.jsonl` is a JSON object:
+```json
+{
+  "images": ["images/trilingual_docs/structured_multi_0001_p1.jpg", "images/trilingual_docs/structured_multi_0001_p2.jpg"],
+  "prompt": "<PAGE><image><PAGE><image>Multi page parsing.",
+  "response": "<PAGE><BLOCK>title<LEVEL1>[76,57,924,105]<FORK>अध्यायः १ — श्रीमद्भगवद्गीता उपदेशः\n<BLOCK>text[76,125,924,260]<FORK>धर्मक्षेत्रे कुरुक्षेत्रे समवेता युयुत्सवः...\n<BLOCK>cross_text[76,720,924,910]<FORK>Paragraph starting on page 1...<PAGE><BLOCK>append_text[76,57,924,210]<FORK>...and continuing on page 2."
+}
+```
+* **Coordinates**: `[x1, y1, x2, y2]` are normalized to the `0–1000` range relative to page width and height.
+* **Block Labels**: `title<LEVEL1..n>`, `text`, `table` (HTML `<table>...</table>`), `equation`, `image`, `figure`, `chart`, `header`, `footer`, `page_number`.
+* **Cross-Page Continuations**: A block split across page $p$ and $p+1$ uses `cross_text` / `cross_table` at the end of page $p$ and `append_text` / `append_table` at the start of page $p+1$.
+
+#### B. Rebuild or Expand the Included Datasets
+To re-run or increase the sample count from the Hugging Face Sanskrit & Devanagari datasets and trilingual document generator:
+```powershell
+.\.venv\Scripts\python.exe scripts/download_and_prepare_datasets.py --hf-max-samples 300
+```
+
+#### C. Convert Your Own Digital PDFs (Hindi / Sanskrit / English) into Training Data
+Drop any digital PDFs (with embedded text) into a folder (e.g., `my_pdfs/`) and run:
+```powershell
+.\.venv\Scripts\python.exe scripts/pdf_to_dataset.py --pdf-dir my_pdfs --out-dir data/custom_pdfs --dpi 180
+```
+This extracts page images (`data/custom_pdfs/images/*.jpg`), normalizes bounding boxes to `0–1000`, builds both single-page and multi-page sliding-window samples, and writes `data/custom_pdfs/train.jsonl`.
+
+---
+
+### 4. Fine-Tuning (`train.py`)
+
+#### A. Run 4-Bit QLoRA Training on 6 GB VRAM
+```powershell
+.\.venv\Scripts\python.exe train.py `
+  --train-data data/unlimited_ocr/train.jsonl `
+  --eval-data data/unlimited_ocr/val.jsonl `
+  --output-dir outputs/unlimited-ocr2-indic-lora `
+  --batch-size 1 `
+  --grad-accum 8 `
+  --max-length 2048 `
+  --lora-r 16 `
+  --lora-alpha 32 `
+  --lr 2e-4 `
+  --epochs 3 `
+  --save-steps 50 `
+  --logging-steps 1
+```
+
+#### B. Live Progress Bar & Monitoring
+During training, `train.py` displays:
+1. **Dataset loading progress bar** (`doc/s`) when reading `train.jsonl` and `val.jsonl`.
+2. **Live `tqdm` training bar** updated every step (`--logging-steps 1`) showing:
+   * Current `Step / Total Steps`, percentage bar, elapsed time, and **ETA**
+   * `epoch` (e.g., `1.20/3`)
+   * `loss` (training loss) & `val_loss` (validation loss)
+   * `lr` (current learning rate)
+   * `vram` (live GPU memory allocated/reserved vs total 6.0 GB)
+3. **Persistent JSONL log**: Every step is appended to `<output-dir>/training_progress.jsonl`. You can inspect it anytime from another terminal:
+   ```powershell
+   Get-Content outputs\unlimited-ocr2-indic-lora\training_progress.jsonl -Wait -Tail 10
+   ```
+
+#### C. `train.py` CLI Reference
+
+| Flag | Default | Description |
+| :--- | :--- | :--- |
+| `--model-name-or-path` | `baidu/Unlimited-OCR-2` | Hugging Face model ID or local checkpoint directory |
+| `--train-data` | *(Required)* | Path to training `.jsonl` file |
+| `--eval-data` | `None` | Optional path to validation `.jsonl` file |
+| `--output-dir` | `outputs/unlimited-ocr2-lora` | Directory to save LoRA adapters, checkpoints, and `training_progress.jsonl` |
+| `--max-length` | `4096` | Max sequence token length (use `2048` on 6 GB VRAM for Devanagari pages) |
+| `--use-4bit` / `--no-4bit` | `--use-4bit` | Enable/disable 4-bit NF4 QLoRA quantization via `bitsandbytes` |
+| `--gradient-checkpointing` | `True` | Recompute activations during backward pass to save VRAM |
+| `--lora-r` | `16` | LoRA rank (`8`, `16`, or `32`) |
+| `--lora-alpha` | `32` | LoRA scaling alpha |
+| `--lora-target-modules` | `q_proj,k_proj,v_proj,o_proj` | Comma-separated modules to adapt (can add `gate_proj,up_proj,down_proj`) |
+| `--batch-size` | `1` | Per-device batch size (keep at `1` for 6 GB VRAM) |
+| `--grad-accum` | `8` | Gradient accumulation steps (effective batch size = `batch_size * grad_accum`) |
+| `--lr` | `2e-4` | Peak learning rate |
+| `--epochs` | `3` | Total training epochs |
+| `--save-steps` | `50` | Save LoRA checkpoint every $N$ steps |
+| `--logging-steps` | `1` | Update live `tqdm` progress bar and log file every $N$ steps |
+
+---
+
+### 5. Running Local Inference (`local_infer.py`)
+
+`local_infer.py` runs `baidu/Unlimited-OCR-2` directly on Windows via Hugging Face `transformers` (with 4-bit quantization enabled by default for 6 GB VRAM) and automatically converts the raw `<PAGE><BLOCK>...<FORK>` output into clean Markdown using `utils/process_unlimitedOCR2.py`.
+
+```powershell
+# 1. Single-page image inference (base model)
+.\.venv\Scripts\python.exe local_infer.py `
+  --images data/unlimited_ocr/images/trilingual_docs/structured_single_0000.jpg `
+  --out-dir outputs/infer_single
+
+# 2. Multi-page image inference (cross-page context preserved)
+.\.venv\Scripts\python.exe local_infer.py `
+  --images data/unlimited_ocr/images/trilingual_docs/structured_multi_0000_p1.jpg data/unlimited_ocr/images/trilingual_docs/structured_multi_0000_p2.jpg `
+  --out-dir outputs/infer_multi
+
+# 3. Direct PDF inference with your fine-tuned LoRA adapter
+.\.venv\Scripts\python.exe local_infer.py `
+  --pdf your_document.pdf `
+  --lora-path outputs/unlimited-ocr2-indic-lora `
+  --out-dir outputs/infer_pdf
+```
+Outputs written to `--out-dir`:
+* `raw_output.txt` — Raw layout blocks (`<PAGE><BLOCK>...[x1,y1,x2,y2]<FORK>...`)
+* `output.md` — Final merged Markdown with headings, HTML tables, and cross-page text stitched together.
+
+---
 
 ## Release
 - [2026/11/02] 📄 The paper of **Unlimited OCR 2** is now available on [arXiv](https://arxiv.org/abs/2610.39308).
