@@ -30,6 +30,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import pymupdf
 from datasets import load_dataset
 from PIL import Image, ImageDraw, ImageOps
+from tqdm.auto import tqdm
 
 # Ensure project root is importable
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -239,7 +240,7 @@ def build_composite_pages_from_hf(
     page_w, page_h = 1024, 1448
     records: List[Dict[str, Any]] = []
 
-    for p_idx in range(num_pages):
+    for p_idx in tqdm(range(num_pages), desc=f"Building {prefix} composite pages", unit="page"):
         canvas = Image.new("RGB", (page_w, page_h), color=(252, 251, 248))
         draw = ImageDraw.Draw(canvas)
         y_cursor = 70
@@ -390,7 +391,7 @@ def generate_trilingual_documents(
     records: List[Dict[str, Any]] = []
 
     # 1. Single-page structured documents (Hindi, Sanskrit, English, and Mixed Trilingual)
-    for idx in range(num_single_page):
+    for idx in tqdm(range(num_single_page), desc="Rendering single-page trilingual docs", unit="doc"):
         mode = idx % 4  # 0: Sanskrit, 1: Hindi, 2: English, 3: Trilingual mixed
         blocks_spec: List[Dict[str, Any]] = []
 
@@ -437,7 +438,7 @@ def generate_trilingual_documents(
         )
 
     # 2. Multi-page documents with cross_text -> append_text across page boundaries
-    for m_idx in range(num_multi_page):
+    for m_idx in tqdm(range(num_multi_page), desc="Rendering multi-page trilingual docs", unit="doc"):
         n_pages = random.randint(2, 3)
         doc_images: List[str] = []
         doc_page_strs: List[str] = []

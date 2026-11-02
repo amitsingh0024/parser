@@ -2,6 +2,7 @@
 """
 Local QLoRA / LoRA Fine-Tuning Script for Baidu Unlimited-OCR-2
 Optimized for single consumer GPU (e.g., NVIDIA RTX 4050 6GB VRAM on Windows).
+Includes live tqdm progress bars with Loss, Learning Rate, ETA, and GPU VRAM tracking.
 
 Dataset format (JSONL):
 Each line is a JSON object with:
@@ -15,36 +16,170 @@ Each line is a JSON object with:
 import argparse
 import json
 import os
+import time
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch
 from PIL import Image
 from torch.utils.data import Dataset
+from tqdm.auto import tqdm
 from transformers import (
     AutoModel,
     AutoTokenizer,
     BitsAndBytesConfig,
     Trainer,
+    TrainerCallback,
+    TrainerControl,
+    TrainerState,
     TrainingArguments,
 )
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
 
+def get_gpu_vram_str() -> str:
+    """Return formatted current/total GPU VRAM usage string."""
+    if not torch.cuda.is_available():
+        return "CPU"
+    alloc_gb = torch.cuda.memory_allocated(0) / (1024**3)
+    res_gb = torch.cuda.memory_reserved(0) / (1024**3)
+    total_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+    return f"{alloc_gb:.2f}G(res {res_gb:.2f}G)/{total_gb:.1f}G"
+
+
+class LiveTrainingProgressCallback(TrainerCallback):
+    """
+    Custom tqdm progress bar + step logger that shows:
+    - Step / Total Steps (%)
+    - Current Epoch
+    - Training Loss & Eval Loss
+    - Learning Rate
+    - Live GPU VRAM consumption on the RTX 4050
+    - Saves step-by-step progress to `<output_dir>/training_progress.jsonl`
+    """
+
+    def __init__(self, output_dir: str):
+        self.output_dir = output_dir
+        self.pbar: Optional[tqdm] = None
+        self.start_time: float = 0.0
+        self.last_loss: Optional[float] = None
+        self.last_lr: Optional[float] = None
+        os.makedirs(self.output_dir, exist_ok=True)
+        self.log_file = os.path.join(self.output_dir, "training_progress.jsonl")
+
+    def on_train_begin(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        **kwargs,
+    ):
+        self.start_time = time.time()
+        self.pbar = tqdm(
+            total=state.max_steps,
+            desc="Training Unlimited-OCR-2",
+            unit="step",
+            dynamic_ncols=True,
+            leave=True,
+        )
+        tqdm.write(
+            f"[PROGRESS] Training started | Total steps: {state.max_steps} | "
+            f"Epochs: {args.num_train_epochs} | GPU VRAM: {get_gpu_vram_str()}"
+        )
+
+    def on_step_end(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        **kwargs,
+    ):
+        if self.pbar is not None:
+            delta = state.global_step - self.pbar.n
+            if delta > 0:
+                self.pbar.update(delta)
+            postfix: Dict[str, Any] = {
+                "epoch": f"{state.epoch or 0.0:.2f}/{args.num_train_epochs:.0f}",
+                "vram": get_gpu_vram_str(),
+            }
+            if self.last_loss is not None:
+                postfix["loss"] = f"{self.last_loss:.4f}"
+            if self.last_lr is not None:
+                postfix["lr"] = f"{self.last_lr:.2e}"
+            self.pbar.set_postfix(postfix, refresh=True)
+
+    def on_log(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        logs: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ):
+        if not logs:
+            return
+        if "loss" in logs:
+            self.last_loss = float(logs["loss"])
+        if "learning_rate" in logs:
+            self.last_lr = float(logs["learning_rate"])
+
+        if self.pbar is not None:
+            postfix: Dict[str, Any] = {
+                "epoch": f"{state.epoch or 0.0:.2f}/{args.num_train_epochs:.0f}",
+                "vram": get_gpu_vram_str(),
+            }
+            if self.last_loss is not None:
+                postfix["loss"] = f"{self.last_loss:.4f}"
+            if self.last_lr is not None:
+                postfix["lr"] = f"{self.last_lr:.2e}"
+            if "eval_loss" in logs:
+                postfix["val_loss"] = f"{float(logs['eval_loss']):.4f}"
+            self.pbar.set_postfix(postfix, refresh=True)
+
+        record = {
+            "step": state.global_step,
+            "max_steps": state.max_steps,
+            "progress_pct": round(100.0 * state.global_step / max(state.max_steps, 1), 2),
+            "epoch": round(float(state.epoch or 0.0), 3),
+            "vram": get_gpu_vram_str(),
+            "elapsed_sec": round(time.time() - self.start_time, 1),
+            **logs,
+        }
+        with open(self.log_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def on_train_end(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        **kwargs,
+    ):
+        if self.pbar is not None:
+            self.pbar.close()
+            self.pbar = None
+        elapsed = time.time() - self.start_time
+        tqdm.write(
+            f"[PROGRESS] Training finished in {elapsed / 60.0:.2f} min | "
+            f"Final step: {state.global_step}/{state.max_steps} | "
+            f"Progress log: {self.log_file}"
+        )
+
+
 class UnlimitedOCRDataset(Dataset):
     """Dataset for single-page and multi-page Unlimited-OCR-2 fine-tuning."""
 
-    def __init__(self, jsonl_path: str, tokenizer: Any, max_length: int = 4096):
+    def __init__(self, jsonl_path: str, tokenizer: Any, max_length: int = 4096, split_name: str = "data"):
         self.samples: List[Dict[str, Any]] = []
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.base_dir = os.path.dirname(os.path.abspath(jsonl_path))
 
         with open(jsonl_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    self.samples.append(json.loads(line))
+            raw_lines = [line.strip() for line in f if line.strip()]
+
+        for line in tqdm(raw_lines, desc=f"Loading {split_name} ({os.path.basename(jsonl_path)})", unit="doc"):
+            self.samples.append(json.loads(line))
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -191,14 +326,14 @@ def main():
     parser.add_argument("--grad-accum", type=int, default=8, help="Gradient accumulation steps")
     parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate")
     parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs")
-    parser.add_argument("--save-steps", type=int, default=100, help="Save checkpoint every N steps")
-    parser.add_argument("--logging-steps", type=int, default=10, help="Log metrics every N steps")
+    parser.add_argument("--save-steps", type=int, default=50, help="Save checkpoint every N steps")
+    parser.add_argument("--logging-steps", type=int, default=1, help="Update progress bar metrics every N steps")
     args = parser.parse_args()
 
     model, tokenizer = build_model_and_tokenizer(args)
-    train_dataset = UnlimitedOCRDataset(args.train_data, tokenizer, max_length=args.max_length)
+    train_dataset = UnlimitedOCRDataset(args.train_data, tokenizer, max_length=args.max_length, split_name="train")
     eval_dataset = (
-        UnlimitedOCRDataset(args.eval_data, tokenizer, max_length=args.max_length)
+        UnlimitedOCRDataset(args.eval_data, tokenizer, max_length=args.max_length, split_name="val")
         if args.eval_data
         else None
     )
@@ -213,10 +348,12 @@ def main():
         fp16=torch.cuda.is_available() and not torch.cuda.is_bf16_supported(),
         optim="paged_adamw_8bit" if args.use_4bit else "adamw_torch",
         logging_steps=args.logging_steps,
+        logging_first_step=True,
         save_steps=args.save_steps,
         save_total_limit=2,
         gradient_checkpointing=args.gradient_checkpointing,
         remove_unused_columns=False,
+        disable_tqdm=True,  # Handled by LiveTrainingProgressCallback with VRAM + loss + ETA
         report_to="none",
     )
 
@@ -226,9 +363,10 @@ def main():
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=DataCollatorForUnlimitedOCR(pad_token_id=tokenizer.pad_token_id),
+        callbacks=[LiveTrainingProgressCallback(output_dir=args.output_dir)],
     )
 
-    print("[INFO] Starting training...")
+    print("[INFO] Starting training with live tqdm progress bar...")
     trainer.train()
 
     print(f"[INFO] Saving LoRA adapter & tokenizer to {args.output_dir}...")

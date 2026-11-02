@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 import pymupdf
+from tqdm.auto import tqdm
 
 
 def norm_coord(val: float, total: float) -> int:
@@ -122,8 +123,8 @@ def main():
     img_dir.mkdir(parents=True, exist_ok=True)
 
     all_records: List[Dict[str, Any]] = []
-    for pdf_file in sorted(pdf_dir.glob("*.pdf")):
-        print(f"[PDF] Processing {pdf_file.name}...")
+    pdf_files = sorted(pdf_dir.glob("*.pdf"))
+    for pdf_file in tqdm(pdf_files, desc="Converting PDFs", unit="pdf"):
         recs = process_pdf(pdf_file, img_dir, out_dir, dpi=args.dpi)
         all_records.extend(recs)
 

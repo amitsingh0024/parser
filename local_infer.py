@@ -22,6 +22,7 @@ from typing import List
 
 import pymupdf as fitz  # PyMuPDF
 import torch
+from tqdm.auto import tqdm
 from transformers import AutoModel, AutoTokenizer, BitsAndBytesConfig
 
 from utils.process_unlimitedOCR2 import convert as convert_to_markdown
@@ -32,7 +33,7 @@ def pdf_to_images(pdf_path: str, dpi: int = 200) -> List[str]:
     tmp_dir = tempfile.mkdtemp(prefix="uocr_pdf_")
     mat = fitz.Matrix(dpi / 72, dpi / 72)
     image_paths: List[str] = []
-    for i, page in enumerate(doc):
+    for i, page in enumerate(tqdm(doc, desc="Rendering PDF pages", unit="page")):
         img_path = os.path.join(tmp_dir, f"page_{i + 1:04d}.jpg")
         page.get_pixmap(matrix=mat).save(img_path)
         image_paths.append(img_path)
