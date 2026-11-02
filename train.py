@@ -15,16 +15,19 @@ Each line is a JSON object with:
 
 import argparse
 import json
+import math
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
-from PIL import Image
+from PIL import Image, ImageOps
 from torch.utils.data import Dataset
+from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import (
+    AutoConfig,
     AutoModel,
     AutoTokenizer,
     BitsAndBytesConfig,
@@ -35,6 +38,21 @@ from transformers import (
     TrainingArguments,
 )
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+
+IMAGE_TOKEN = "<image>"
+IMAGE_TOKEN_ID = 128815
+BOS_TOKEN_ID = 0
+BASE_IMAGE_SIZE = 1024
+PATCH_SIZE = 16
+DOWNSAMPLE_RATIO = 4
+
+_IMG_TRANSFORM = transforms.Compose(
+    [
+        transforms.ToTensor(),
+        transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
+    ]
+)
+_PAD_COLOR = (127, 127, 127)
 
 
 def get_gpu_vram_str() -> str:
@@ -166,10 +184,82 @@ class LiveTrainingProgressCallback(TrainerCallback):
         )
 
 
+def build_uocr_multimodal_sample(
+    tokenizer: Any,
+    prompt: str,
+    response: str,
+    pil_images: List[Image.Image],
+    max_length: int = 2048,
+) -> Dict[str, Any]:
+    """
+    Build Unlimited-OCR-2 multimodal inputs matching `_uocr_build_inputs` in `modeling_unlimitedocr.py`:
+    - Each `<image>` in `prompt` is expanded into 273 `IMAGE_TOKEN_ID` (128815) tokens (base mode).
+    - `images_seq_mask` is True at those 273 * N_pages positions so `UnlimitedOCRModel.forward`
+      scatters the vision encoder features into `inputs_embeds`.
+    - `labels` masks prompt + image tokens with -100 and supervises the response tokens.
+    """
+    n_img = len(pil_images)
+    splits = prompt.split(IMAGE_TOKEN)
+    if len(splits) != n_img + 1:
+        prompt = "<PAGE><image>" * n_img + "Multi page parsing."
+        splits = prompt.split(IMAGE_TOKEN)
+
+    nqb = math.ceil((BASE_IMAGE_SIZE // PATCH_SIZE) / DOWNSAMPLE_RATIO)  # 16
+    per_page_img_tokens = nqb * (nqb + 1) + 1  # 273 tokens per page image
+
+    ids: List[int] = [BOS_TOKEN_ID]
+    seq_mask: List[bool] = [False]
+    globals_list: List[torch.Tensor] = []
+    spatial_list: List[List[int]] = []
+
+    for text_sep, img in zip(splits, pil_images):
+        sep_ids = tokenizer.encode(text_sep, add_special_tokens=False)
+        ids.extend(sep_ids)
+        seq_mask.extend([False] * len(sep_ids))
+
+        padded_img = ImageOps.pad(img, (BASE_IMAGE_SIZE, BASE_IMAGE_SIZE), color=_PAD_COLOR)
+        globals_list.append(_IMG_TRANSFORM(padded_img).to(torch.bfloat16))
+        spatial_list.append([1, 1])
+
+        img_toks = [IMAGE_TOKEN_ID] * per_page_img_tokens
+        ids.extend(img_toks)
+        seq_mask.extend([True] * per_page_img_tokens)
+
+    tail_ids = tokenizer.encode(splits[-1], add_special_tokens=False)
+    ids.extend(tail_ids)
+    seq_mask.extend([False] * len(tail_ids))
+
+    prompt_len = len(ids)
+
+    resp_ids = tokenizer.encode(response, add_special_tokens=False)
+    eos_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 1
+    if not resp_ids or resp_ids[-1] != eos_id:
+        resp_ids.append(eos_id)
+
+    # Ensure we never truncate inside the image token region
+    max_resp_len = max(64, max_length - prompt_len)
+    resp_ids = resp_ids[:max_resp_len]
+
+    full_ids = ids + resp_ids
+    full_seq_mask = seq_mask + [False] * len(resp_ids)
+    labels = [-100] * prompt_len + resp_ids
+
+    images_ori = torch.stack(globals_list, dim=0)  # [num_pages, 3, 1024, 1024]
+    images_crop = torch.zeros((1, 3, BASE_IMAGE_SIZE, BASE_IMAGE_SIZE), dtype=torch.bfloat16)
+    spatial = torch.tensor(spatial_list, dtype=torch.long)
+
+    return {
+        "input_ids": torch.tensor(full_ids, dtype=torch.long),
+        "labels": torch.tensor(labels, dtype=torch.long),
+        "images_seq_mask": torch.tensor(full_seq_mask, dtype=torch.bool),
+        "image_tuple": (images_crop, images_ori, spatial),
+    }
+
+
 class UnlimitedOCRDataset(Dataset):
     """Dataset for single-page and multi-page Unlimited-OCR-2 fine-tuning."""
 
-    def __init__(self, jsonl_path: str, tokenizer: Any, max_length: int = 4096, split_name: str = "data"):
+    def __init__(self, jsonl_path: str, tokenizer: Any, max_length: int = 2048, split_name: str = "data"):
         self.samples: List[Dict[str, Any]] = []
         self.tokenizer = tokenizer
         self.max_length = max_length
@@ -191,39 +281,19 @@ class UnlimitedOCRDataset(Dataset):
             p if os.path.isabs(p) else os.path.join(self.base_dir, p)
             for p in image_paths
         ]
-        images = [Image.open(p).convert("RGB") for p in resolved_paths]
+        pil_images = [Image.open(p).convert("RGB") for p in resolved_paths]
 
         prompt = item.get("prompt")
         if not prompt:
-            if len(images) > 1:
-                prompt = "<PAGE><image>" * len(images) + "Multi page parsing."
-            else:
-                prompt = "<image>\nFree OCR."
+            prompt = "<PAGE><image>" * len(pil_images) + "Multi page parsing."
 
-        response = item["response"]
-        full_text = f"{prompt}{response}"
-
-        prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=True)
-        full_ids = self.tokenizer.encode(
-            full_text,
-            add_special_tokens=True,
-            truncation=True,
+        return build_uocr_multimodal_sample(
+            tokenizer=self.tokenizer,
+            prompt=prompt,
+            response=item["response"],
+            pil_images=pil_images,
             max_length=self.max_length,
         )
-        if full_ids[-1] != self.tokenizer.eos_token_id and len(full_ids) < self.max_length:
-            full_ids.append(self.tokenizer.eos_token_id)
-
-        labels = list(full_ids)
-        prompt_len = min(len(prompt_ids), len(labels))
-        for i in range(prompt_len):
-            labels[i] = -100
-
-        return {
-            "input_ids": torch.tensor(full_ids, dtype=torch.long),
-            "labels": torch.tensor(labels, dtype=torch.long),
-            "images": images,
-            "image_paths": resolved_paths,
-        }
 
 
 @dataclass
@@ -233,6 +303,7 @@ class DataCollatorForUnlimitedOCR:
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
         input_ids = [f["input_ids"] for f in features]
         labels = [f["labels"] for f in features]
+        seq_masks = [f["images_seq_mask"] for f in features]
 
         input_ids_padded = torch.nn.utils.rnn.pad_sequence(
             input_ids, batch_first=True, padding_value=self.pad_token_id
@@ -240,12 +311,29 @@ class DataCollatorForUnlimitedOCR:
         labels_padded = torch.nn.utils.rnn.pad_sequence(
             labels, batch_first=True, padding_value=-100
         )
+        seq_mask_padded = torch.nn.utils.rnn.pad_sequence(
+            seq_masks, batch_first=True, padding_value=False
+        )
         attention_mask = input_ids_padded.ne(self.pad_token_id).long()
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        images_batch: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        for f in features:
+            crop_t, ori_t, spatial_t = f["image_tuple"]
+            images_batch.append(
+                (
+                    crop_t.to(device, non_blocking=True),
+                    ori_t.to(device, non_blocking=True),
+                    spatial_t.to(device, non_blocking=True),
+                )
+            )
 
         return {
             "input_ids": input_ids_padded,
             "attention_mask": attention_mask,
             "labels": labels_padded,
+            "images": images_batch,
+            "images_seq_mask": seq_mask_padded,
         }
 
 
@@ -257,6 +345,14 @@ def build_model_and_tokenizer(args: argparse.Namespace):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    print(f"[INFO] Loading config from {args.model_name_or_path}...")
+    config = AutoConfig.from_pretrained(
+        args.model_name_or_path, trust_remote_code=True
+    )
+    # Use native PyTorch SDPA path on Windows (avoids runtime MSVC cl.exe Triton JIT requirement)
+    if hasattr(config, "sparse_attention_config") and isinstance(config.sparse_attention_config, dict):
+        config.sparse_attention_config["dash_use_triton"] = False
+
     quant_config = None
     if args.use_4bit:
         print("[INFO] Enabling 4-bit QLoRA quantization (NF4, bfloat16 compute)...")
@@ -265,11 +361,20 @@ def build_model_and_tokenizer(args: argparse.Namespace):
             bnb_4bit_quant_type="nf4",
             bnb_4bit_compute_dtype=torch.bfloat16,
             bnb_4bit_use_double_quant=True,
+            llm_int8_skip_modules=[
+                "sam_model",
+                "vision_model",
+                "projector",
+                "lm_head",
+                "dash_router",
+                "indexer",
+            ],
         )
 
     print(f"[INFO] Loading model {args.model_name_or_path}...")
     model = AutoModel.from_pretrained(
         args.model_name_or_path,
+        config=config,
         trust_remote_code=True,
         use_safetensors=True,
         torch_dtype=torch.bfloat16,
@@ -310,7 +415,7 @@ def main():
     parser.add_argument("--train-data", required=True, help="Path to training JSONL file")
     parser.add_argument("--eval-data", default=None, help="Optional path to evaluation JSONL file")
     parser.add_argument("--output-dir", default="outputs/unlimited-ocr2-lora", help="Directory to save checkpoints and adapter")
-    parser.add_argument("--max-length", type=int, default=4096, help="Max token sequence length (lower = less VRAM)")
+    parser.add_argument("--max-length", type=int, default=2048, help="Max token sequence length (lower = less VRAM)")
     parser.add_argument("--use-4bit", action="store_true", default=True, help="Use 4-bit QLoRA quantization (recommended for 6GB VRAM)")
     parser.add_argument("--no-4bit", action="store_false", dest="use_4bit", help="Disable 4-bit quantization")
     parser.add_argument("--gradient-checkpointing", action="store_true", default=True, help="Enable gradient checkpointing")

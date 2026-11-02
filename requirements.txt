@@ -10,6 +10,7 @@ addict==2.4.0
 einops==0.8.2
 easydict==1.13
 pymupdf
+triton-windows; sys_platform == "win32"
 
 # Training & Fine-Tuning (LoRA / QLoRA on 6GB VRAM)
 accelerate

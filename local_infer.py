@@ -23,7 +23,7 @@ from typing import List
 import pymupdf as fitz  # PyMuPDF
 import torch
 from tqdm.auto import tqdm
-from transformers import AutoModel, AutoTokenizer, BitsAndBytesConfig
+from transformers import AutoConfig, AutoModel, AutoTokenizer, BitsAndBytesConfig
 
 from utils.process_unlimitedOCR2 import convert as convert_to_markdown
 
@@ -62,6 +62,10 @@ def main():
     print(f"[INFO] Loading tokenizer from {args.model}...")
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
 
+    config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
+    if hasattr(config, "sparse_attention_config") and isinstance(config.sparse_attention_config, dict):
+        config.sparse_attention_config["dash_use_triton"] = False
+
     quant_config = None
     if args.use_4bit:
         print("[INFO] Using 4-bit quantization for low-VRAM GPU...")
@@ -70,11 +74,20 @@ def main():
             bnb_4bit_quant_type="nf4",
             bnb_4bit_compute_dtype=torch.bfloat16,
             bnb_4bit_use_double_quant=True,
+            llm_int8_skip_modules=[
+                "sam_model",
+                "vision_model",
+                "projector",
+                "lm_head",
+                "dash_router",
+                "indexer",
+            ],
         )
 
     print(f"[INFO] Loading model from {args.model}...")
     model = AutoModel.from_pretrained(
         args.model,
+        config=config,
         trust_remote_code=True,
         use_safetensors=True,
         torch_dtype=torch.bfloat16,
