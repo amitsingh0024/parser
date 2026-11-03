@@ -45,12 +45,16 @@ def main():
     parser = argparse.ArgumentParser(description="Local Unlimited-OCR-2 Inference")
     parser.add_argument("--model", default="baidu/Unlimited-OCR-2", help="Model ID or local path")
     parser.add_argument("--lora-path", default=None, help="Optional path to fine-tuned LoRA adapter")
+    parser.add_argument("--image", dest="images", nargs="+", default=None, help="One or more page image paths")
     parser.add_argument("--images", nargs="+", default=None, help="One or more page image paths in order")
     parser.add_argument("--pdf", default=None, help="Path to a PDF file to convert and parse")
     parser.add_argument("--dpi", type=int, default=200, help="DPI when rendering PDF pages")
     parser.add_argument("--out-dir", default="outputs/infer", help="Output directory for raw and markdown results")
     parser.add_argument("--use-4bit", action="store_true", default=True, help="Load model in 4-bit NF4 (recommended for 6GB VRAM)")
     parser.add_argument("--no-4bit", action="store_false", dest="use_4bit", help="Load model in native bfloat16")
+    parser.add_argument("--max-new-tokens", type=int, default=4096, help="Maximum new tokens to generate")
+    parser.add_argument("--no-repeat-ngram-size", type=int, default=15, help="Prevent repeating n-grams of this length (0 to disable)")
+    parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature (0.0 for greedy)")
     args = parser.parse_args()
 
     if not args.images and not args.pdf:
@@ -111,6 +115,9 @@ def main():
             image_file=image_files[0],
             output_path=args.out_dir,
             save_results=True,
+            max_new_tokens=args.max_new_tokens,
+            no_repeat_ngram_size=args.no_repeat_ngram_size,
+            temperature=args.temperature,
         )
     else:
         print(f"[INFO] Running multi-page inference on {len(image_files)} pages...")
@@ -119,6 +126,9 @@ def main():
             image_files=image_files,
             output_path=args.out_dir,
             save_results=True,
+            max_new_tokens=args.max_new_tokens,
+            no_repeat_ngram_size=args.no_repeat_ngram_size,
+            temperature=args.temperature,
         )
         print(f"[INFO] Generated {num_tokens} tokens across {len(image_files)} pages.")
 
