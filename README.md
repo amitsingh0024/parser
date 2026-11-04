@@ -56,10 +56,14 @@ This repository is configured to fine-tune and run **Baidu Unlimited-OCR-2** (`b
 baidu-parser/
 ├── .venv/                                    # Local Python 3.11 + CUDA 12.8 virtual environment
 ├── requirements.txt                          # Pinned dependencies for Unlimited-OCR-2 + QLoRA
+├── app.py                                    # FastAPI web server with REST API & PDF/image parsing pipeline
+├── templates/index.html                      # Modern responsive Web Studio UI (drag-and-drop, Markdown, boxes)
+├── run_ui.bat                                # Double-click launcher for the Web Studio (http://localhost:8000)
 ├── train.py                                  # Single-GPU 4-bit QLoRA training script with live tqdm progress bar
 ├── local_infer.py                            # Local Windows Transformers inference (images, PDFs, LoRA adapters)
 ├── infer.py                                  # Upstream batch SGLang client for MPDocBench / MarathonDocBench
 ├── scripts/
+│   ├── benchmark_evaluation.py               # CER, WER, NED accuracy benchmark evaluator across validation set
 │   ├── download_and_prepare_datasets.py      # Downloads HF Sanskrit/Devanagari datasets & builds trilingual pages
 │   └── pdf_to_dataset.py                     # Converts custom digital PDFs into Unlimited-OCR-2 training JSONL
 ├── utils/
@@ -206,7 +210,28 @@ During training, `train.py` displays:
 
 ---
 
-### 5. Running Local Inference (`local_infer.py`)
+### 5. Web Studio & UI (`app.py`)
+
+A full interactive Web Studio with drag-and-drop file upload, live Markdown rendering, and visual bounding box overlays:
+
+#### Launch the Web Studio
+```powershell
+# Double-click run_ui.bat or run in PowerShell:
+.\.venv\Scripts\python.exe -m uvicorn app:app --host 127.0.0.1 --port 8000
+```
+Open **[http://localhost:8000](http://localhost:8000)** in your browser.
+
+#### Features
+1. **Drag-and-Drop Document Uploader**: Supports PDF (single or multi-page), PNG, JPG, and WEBP.
+2. **Three-Way Output Inspection**:
+   * **📄 Rendered Markdown**: Formatted headings, tables, and paragraphs with one-click **Copy** and **Download `.md`**.
+   * **🎯 Visual Bounding Boxes**: Displays color-coded bounding boxes drawn over detected titles, paragraphs, and tables.
+   * **🏷️ Raw Layout Tokens**: Shows the underlying `<PAGE><BLOCK>...<FORK>` syntax.
+3. **Model Configuration**: Select between the final 3-epoch production model or intermediate checkpoints (`checkpoint-300`, `checkpoint-250`), with adjustable anti-repetition N-gram penalty and max token sliders.
+
+---
+
+### 6. Running Local CLI Inference (`local_infer.py`)
 
 `local_infer.py` runs `baidu/Unlimited-OCR-2` directly on Windows via Hugging Face `transformers` (with 4-bit quantization enabled by default for 6 GB VRAM) and automatically converts the raw `<PAGE><BLOCK>...<FORK>` output into clean Markdown using `utils/process_unlimitedOCR2.py`.
 
