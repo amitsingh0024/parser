@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.git/
+.gitignore
+outputs/checkpoint-*
+outputs/web_results/
+data/cache/
+wandb/
+.idea/
+.vscode/

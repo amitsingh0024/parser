@@ -161,6 +161,7 @@ async def parse_document(
     no_repeat_ngram_size: int = Form(15),
     temperature: float = Form(0.0),
     checkpoint: Optional[str] = Form("latest"),
+    fast_mode: bool = Form(True),
 ):
     request_id = str(uuid.uuid4())[:8]
     req_out_dir = os.path.join(RESULTS_DIR, request_id)
@@ -193,6 +194,9 @@ async def parse_document(
 
         t_start = time.time()
         try:
+        use_crops = not fast_mode
+        print(f"[INFO] Processing request (fast_mode={fast_mode}, crop_mode={use_crops})...")
+        try:
             if len(temp_image_paths) == 1:
                 raw_text = MODEL.infer(
                     TOKENIZER,
@@ -203,7 +207,8 @@ async def parse_document(
                     no_repeat_ngram_size=no_repeat_ngram_size,
                     temperature=temperature,
                     eval_mode=True,
-                    crop_mode=True,
+                    crop_mode=use_crops,
+                    tps_interval=25,
                 )
             else:
                 raw_text, _ = MODEL.infer_multi(
@@ -215,6 +220,8 @@ async def parse_document(
                     no_repeat_ngram_size=no_repeat_ngram_size,
                     temperature=temperature,
                     eval_mode=True,
+                    crop_mode=use_crops,
+                    tps_interval=25,
                 )
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Inference error: {str(e)}")

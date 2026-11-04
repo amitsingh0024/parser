@@ -111,7 +111,24 @@
           </select>
         </div>
 
-        <!-- Sliders -->
+        <!-- Speed / Quality Mode Toggle -->
+        <div>
+          <label class="block text-xs font-medium text-slate-300 mb-1.5 flex items-center justify-between">
+            <span>Parsing Mode</span>
+            <span id="modeBadge" class="text-xs font-mono text-emerald-400">⚡ Fast (~20s)</span>
+          </label>
+          <div class="grid grid-cols-2 gap-2 p-1 bg-slate-900 border border-slate-700 rounded-lg text-xs">
+            <button type="button" id="btnFastMode" class="py-1.5 px-3 rounded-md font-medium transition-all bg-sky-500 text-white shadow">
+              ⚡ Fast Mode (273 tok)
+            </button>
+            <button type="button" id="btnHdMode" class="py-1.5 px-3 rounded-md font-medium transition-all text-slate-400 hover:text-slate-200">
+              🔍 Ultra-HD Crop (1513 tok)
+            </button>
+          </div>
+          <p id="modeDescription" class="text-xs text-slate-400 mt-1">
+            Optimized for standard PDFs & images. Runs in ~15–25 seconds.
+          </p>
+        </div>
         <div class="grid grid-cols-2 gap-4">
           <div>
             <div class="flex items-center justify-between text-xs text-slate-300 mb-1">
@@ -315,6 +332,30 @@
       parseBtn.disabled = true;
     });
 
+    let isFastMode = true;
+    const btnFastMode = document.getElementById('btnFastMode');
+    const btnHdMode = document.getElementById('btnHdMode');
+    const modeBadge = document.getElementById('modeBadge');
+    const modeDescription = document.getElementById('modeDescription');
+
+    btnFastMode.addEventListener('click', () => {
+      isFastMode = true;
+      btnFastMode.className = "py-1.5 px-3 rounded-md font-medium transition-all bg-sky-500 text-white shadow";
+      btnHdMode.className = "py-1.5 px-3 rounded-md font-medium transition-all text-slate-400 hover:text-slate-200";
+      modeBadge.textContent = "⚡ Fast (~20s)";
+      modeBadge.className = "text-xs font-mono text-emerald-400";
+      modeDescription.textContent = "Optimized for standard PDFs & images. Runs in ~15–25 seconds.";
+    });
+
+    btnHdMode.addEventListener('click', () => {
+      isFastMode = false;
+      btnHdMode.className = "py-1.5 px-3 rounded-md font-medium transition-all bg-indigo-600 text-white shadow";
+      btnFastMode.className = "py-1.5 px-3 rounded-md font-medium transition-all text-slate-400 hover:text-slate-200";
+      modeBadge.textContent = "🔍 Ultra-HD (48 crops)";
+      modeBadge.className = "text-xs font-mono text-indigo-400";
+      modeDescription.textContent = "Multi-patch slicing for tiny fonts & dense manuscripts. Takes ~60–90 seconds.";
+    });
+
     // Parse Click
     parseBtn.addEventListener('click', async () => {
       if (!currentFile) return;
@@ -332,6 +373,7 @@
       formData.append('max_tokens', maxTokensSlider.value);
       formData.append('no_repeat_ngram_size', ngramSlider.value);
       formData.append('checkpoint', checkpointSelect.value);
+      formData.append('fast_mode', isFastMode ? 'true' : 'false');
 
       try {
         const res = await fetch('/api/parse', { method: 'POST', body: formData });
