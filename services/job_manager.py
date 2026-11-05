@@ -59,9 +59,11 @@ class JobManager:
             "started_at": None,
             "completed_at": None,
             "progress": {
+                "pages_done": 0,
+                "pages_total": 0,
                 "current_page": 0,
                 "total_pages": 0,
-                "percentage": 0,
+                "percentage": 0.0,
             },
             "parameters": {
                 "filename": filename,
@@ -86,6 +88,8 @@ class JobManager:
         if job_id in self.jobs:
             pct = round((current_page / max(1, total_pages)) * 100, 1)
             self.jobs[job_id]["progress"] = {
+                "pages_done": current_page,
+                "pages_total": total_pages,
                 "current_page": current_page,
                 "total_pages": total_pages,
                 "percentage": pct,

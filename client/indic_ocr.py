@@ -5,7 +5,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
 
 
@@ -22,6 +22,9 @@ class ParseResult:
     raw_layout: str
     annotated_image_url: Optional[str]
     annotated_image_urls: List[str]
+    model_version: Optional[str] = None
+    resolved_checkpoint: Optional[str] = None
+    regions: List[Dict[str, Any]] = field(default_factory=list)
 
     def save_markdown(self, output_path: str):
         """Save parsed markdown directly to a local file."""
@@ -64,6 +67,9 @@ class JobHandle:
                     raw_layout=data.get("raw_layout", ""),
                     annotated_image_url=data.get("annotated_image_url"),
                     annotated_image_urls=data.get("annotated_image_urls", []),
+                    model_version=data.get("model_version"),
+                    resolved_checkpoint=data.get("resolved_checkpoint"),
+                    regions=data.get("regions", []),
                 )
             elif current_status == "failed":
                 err = st.get("error", "Unknown error")
@@ -81,17 +87,19 @@ class IndicOCRClient:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
 
-    def _headers(self, content_type: Optional[str] = None) -> Dict[str, str]:
-        headers = {"User-Agent": "IndicOCR-Client/1.0"}
+    def _headers(self, content_type: Optional[str] = None, idempotency_key: Optional[str] = None) -> Dict[str, str]:
+        headers = {"User-Agent": "IndicOCR-Client/2.1"}
         if self.api_key:
             headers["X-API-Key"] = self.api_key
             headers["Authorization"] = f"Bearer {self.api_key}"
+        if idempotency_key:
+            headers["Idempotency-Key"] = idempotency_key
         if content_type:
             headers["Content-Type"] = content_type
         return headers
 
     def health(self) -> Dict[str, Any]:
-        """Check microservice health, GPU status, and VRAM utilization."""
+        """Check microservice health, GPU status, model version, and VRAM utilization."""
         req = urllib.request.Request(f"{self.base_url}/healthz", headers=self._headers())
         with urllib.request.urlopen(req) as resp:
             return json.loads(resp.read().decode("utf-8"))
@@ -111,6 +119,8 @@ class IndicOCRClient:
         no_repeat_ngram_size: int = 15,
         temperature: float = 0.0,
         checkpoint: str = "latest",
+        script: str = "auto",
+        idempotency_key: Optional[str] = None,
     ) -> ParseResult:
         """Synchronously parse a document (image or PDF) and block until completed."""
         fields = {
@@ -120,12 +130,13 @@ class IndicOCRClient:
             "no_repeat_ngram_size": str(no_repeat_ngram_size),
             "temperature": str(temperature),
             "checkpoint": checkpoint,
+            "script": script,
         }
         body, content_type = self._encode_multipart(fields, file_path)
         req = urllib.request.Request(
             f"{self.base_url}/v1/parse",
             data=body,
-            headers=self._headers(content_type),
+            headers=self._headers(content_type, idempotency_key=idempotency_key),
             method="POST",
         )
         with urllib.request.urlopen(req) as resp:
@@ -142,7 +153,39 @@ class IndicOCRClient:
                 raw_layout=data.get("raw_layout", ""),
                 annotated_image_url=data.get("annotated_image_url"),
                 annotated_image_urls=data.get("annotated_image_urls", []),
+                model_version=data.get("model_version"),
+                resolved_checkpoint=data.get("resolved_checkpoint"),
+                regions=data.get("regions", []),
             )
+
+    def parse_regions(
+        self,
+        file_path: str,
+        regions: List[Dict[str, int]],
+        page: int = 1,
+        script: str = "auto",
+        checkpoint: str = "latest",
+    ) -> Dict[str, Any]:
+        """
+        Targeted region recognition on specific bounding boxes.
+        Accepts regions=[{"x0": .., "y0": .., "x1": .., "y1": ..}, ...]
+        Returns high-accuracy recognition per region crop.
+        """
+        fields = {
+            "regions": json.dumps(regions),
+            "page": str(page),
+            "script": script,
+            "checkpoint": checkpoint,
+        }
+        body, content_type = self._encode_multipart(fields, file_path)
+        req = urllib.request.Request(
+            f"{self.base_url}/v1/parse/regions",
+            data=body,
+            headers=self._headers(content_type),
+            method="POST",
+        )
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read().decode("utf-8"))
 
     def submit_job(
         self,
@@ -153,7 +196,9 @@ class IndicOCRClient:
         no_repeat_ngram_size: int = 15,
         temperature: float = 0.0,
         checkpoint: str = "latest",
+        script: str = "auto",
         callback_url: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
     ) -> JobHandle:
         """Submit an asynchronous job to the task queue and return a JobHandle."""
         fields = {
@@ -163,6 +208,7 @@ class IndicOCRClient:
             "no_repeat_ngram_size": str(no_repeat_ngram_size),
             "temperature": str(temperature),
             "checkpoint": checkpoint,
+            "script": script,
         }
         if callback_url:
             fields["callback_url"] = callback_url
@@ -171,7 +217,7 @@ class IndicOCRClient:
         req = urllib.request.Request(
             f"{self.base_url}/v1/jobs",
             data=body,
-            headers=self._headers(content_type),
+            headers=self._headers(content_type, idempotency_key=idempotency_key),
             method="POST",
         )
         with urllib.request.urlopen(req) as resp:
