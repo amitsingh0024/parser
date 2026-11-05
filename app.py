@@ -107,15 +107,39 @@ def load_model_if_needed(lora_path: Optional[str] = DEFAULT_LORA_PATH):
     print("[INFO] Model loaded and ready for inference!")
 
 
-def pdf_to_images(pdf_bytes: bytes, dpi: int = 180) -> List[str]:
+def parse_page_selection(range_str: str, total_pages: int) -> List[int]:
+    """Parse string like '1', '1-3', '1, 3, 5', 'all' into 0-indexed page list."""
+    if not range_str or range_str.strip().lower() == "all":
+        return list(range(total_pages))
+    selected = set()
+    parts = range_str.replace(" ", "").split(",")
+    for part in parts:
+        if "-" in part:
+            sub = part.split("-")
+            if len(sub) == 2 and sub[0].isdigit() and sub[1].isdigit():
+                start = max(1, int(sub[0]))
+                end = min(total_pages, int(sub[1]))
+                for p in range(start, end + 1):
+                    selected.add(p - 1)
+        elif part.isdigit():
+            val = int(part)
+            if 1 <= val <= total_pages:
+                selected.add(val - 1)
+    res = sorted(list(selected))
+    return res if res else [0]
+
+
+def pdf_to_images(pdf_bytes: bytes, page_indices: Optional[List[int]] = None, dpi: int = 180) -> List[str]:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     tmp_dir = tempfile.mkdtemp(prefix="uocr_web_pdf_")
     mat = fitz.Matrix(dpi / 72, dpi / 72)
     image_paths: List[str] = []
-    for i, page in enumerate(doc):
-        img_path = os.path.join(tmp_dir, f"page_{i + 1:04d}.jpg")
-        page.get_pixmap(matrix=mat).save(img_path)
-        image_paths.append(img_path)
+    targets = page_indices if page_indices is not None else list(range(len(doc)))
+    for idx in targets:
+        if 0 <= idx < len(doc):
+            img_path = os.path.join(tmp_dir, f"page_{idx + 1:04d}.jpg")
+            doc[idx].get_pixmap(matrix=mat).save(img_path)
+            image_paths.append(img_path)
     doc.close()
     return image_paths
 
@@ -168,6 +192,7 @@ async def get_status():
 @app.post("/api/parse")
 async def parse_document(
     file: UploadFile = File(...),
+    pages: str = Form("1"),
     max_tokens: int = Form(2048),
     no_repeat_ngram_size: int = Form(15),
     temperature: float = Form(0.0),
@@ -187,12 +212,20 @@ async def parse_document(
         f.write(content)
 
     temp_image_paths = []
+    selected_page_numbers = []
     if filename.endswith(".pdf"):
-        temp_image_paths = pdf_to_images(content)
+        doc_temp = fitz.open(stream=content, filetype="pdf")
+        total_doc_pages = len(doc_temp)
+        doc_temp.close()
+
+        target_indices = parse_page_selection(pages, total_doc_pages)
+        selected_page_numbers = [i + 1 for i in target_indices]
+        temp_image_paths = pdf_to_images(content, page_indices=target_indices)
         if not temp_image_paths:
-            raise HTTPException(status_code=400, detail="Unable to extract pages from PDF.")
+            raise HTTPException(status_code=400, detail="Unable to extract requested pages from PDF.")
     else:
         temp_image_paths = [orig_save_path]
+        selected_page_numbers = [1]
 
     async with MODEL_LOCK:
         target_lora = DEFAULT_LORA_PATH
@@ -205,13 +238,23 @@ async def parse_document(
 
         t_start = time.time()
         use_crops = not fast_mode
-        print(f"[INFO] Processing request (fast_mode={fast_mode}, crop_mode={use_crops})...")
+        print(f"[INFO] Processing request (pages={selected_page_numbers}, fast_mode={fast_mode}, crop_mode={use_crops})...")
+        
+        page_mds = []
+        page_raws = []
+        annotated_box_imgs = []
+
         try:
-            if len(temp_image_paths) == 1:
-                raw_text = MODEL.infer(
+            for idx, img_path in enumerate(temp_image_paths):
+                p_num = selected_page_numbers[idx]
+                page_out_dir = req_out_dir if len(temp_image_paths) == 1 else os.path.join(req_out_dir, f"page_{p_num}")
+                os.makedirs(page_out_dir, exist_ok=True)
+                print(f"[INFO] Running inference on page {p_num} ({idx + 1}/{len(temp_image_paths)})...")
+
+                p_raw = MODEL.infer(
                     TOKENIZER,
-                    image_file=temp_image_paths[0],
-                    output_path=req_out_dir,
+                    image_file=img_path,
+                    output_path=page_out_dir,
                     save_results=True,
                     max_new_tokens=max_tokens,
                     no_repeat_ngram_size=no_repeat_ngram_size,
@@ -220,36 +263,37 @@ async def parse_document(
                     crop_mode=use_crops,
                     tps_interval=25,
                 )
-            else:
-                raw_text, _ = MODEL.infer_multi(
-                    TOKENIZER,
-                    image_files=temp_image_paths,
-                    output_path=req_out_dir,
-                    save_results=True,
-                    max_new_tokens=max_tokens,
-                    no_repeat_ngram_size=no_repeat_ngram_size,
-                    temperature=temperature,
-                    eval_mode=True,
-                    crop_mode=use_crops,
-                    tps_interval=25,
-                )
+                page_raws.append(p_raw)
+
+                try:
+                    p_md = convert_to_markdown(p_raw)
+                except Exception:
+                    p_md = p_raw
+
+                if len(temp_image_paths) > 1:
+                    page_mds.append(f"### 📄 Page {p_num}\n\n{p_md}")
+                else:
+                    page_mds.append(p_md)
+
+                box_filename = "result_with_boxes_0.jpg"
+                box_path = os.path.join(page_out_dir, box_filename)
+                if os.path.exists(box_path):
+                    rel_url = f"/results/{request_id}/{box_filename}" if len(temp_image_paths) == 1 else f"/results/{request_id}/page_{p_num}/{box_filename}"
+                    annotated_box_imgs.append(rel_url)
+
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Inference error: {str(e)}")
 
         latency = round(time.time() - t_start, 2)
 
-    # Convert to Markdown
-    try:
-        md_text = convert_to_markdown(raw_text)
-    except Exception:
-        md_text = raw_text
+    raw_text = "\n\n<PAGE>\n\n".join(page_raws)
+    md_text = "\n\n---\n\n".join(page_mds)
 
-    # Locate generated bounding box image if created by Baidu's _uocr_save_results
-    annotated_box_img = None
-    box_filename = "result_with_boxes_0.jpg"
-    box_path = os.path.join(req_out_dir, box_filename)
-    if os.path.exists(box_path):
-        annotated_box_img = f"/results/{request_id}/{box_filename}"
+    # Persist markdown results
+    with open(os.path.join(req_out_dir, "result.md"), "w", encoding="utf-8") as f:
+        f.write(md_text)
+    with open(os.path.join(req_out_dir, "result_raw.md"), "w", encoding="utf-8") as f:
+        f.write(raw_text)
 
     # Clean up PDF temp images if created
     if filename.endswith(".pdf") and temp_image_paths:
@@ -264,12 +308,14 @@ async def parse_document(
         "request_id": request_id,
         "filename": file.filename,
         "pages_parsed": len(temp_image_paths),
+        "selected_pages": selected_page_numbers,
         "latency_sec": latency,
         "tokens": token_count,
         "tokens_per_sec": tok_per_sec,
         "markdown": md_text,
         "raw_layout": raw_text,
-        "annotated_image_url": annotated_box_img,
+        "annotated_image_url": annotated_box_imgs[0] if annotated_box_imgs else None,
+        "annotated_image_urls": annotated_box_imgs,
     }
 
 
