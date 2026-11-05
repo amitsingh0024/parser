@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
-FastAPI Server for Baidu Unlimited-OCR-2 Document Parser.
-Supports PDF and Image parsing, Markdown extraction, and Visual Bounding Box overlays.
+FastAPI Production Microservice for Baidu Unlimited-OCR-2 Document Parser.
+Provides Synchronous and Asynchronous task pipelines, Layout parsing,
+Bounding Box generation, and API Authentication.
 """
 
 import asyncio
+import datetime
 import os
 import shutil
 import sys
 import tempfile
 import time
 import uuid
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 sys.stdout.reconfigure(encoding="utf-8")
 sys.stderr.reconfigure(encoding="utf-8")
@@ -32,16 +34,38 @@ os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 import pymupdf as fitz
 import torch
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import (
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Query,
+    Security,
+    UploadFile,
+    status,
+)
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.security.api_key import APIKeyHeader, APIKeyQuery
 from fastapi.staticfiles import StaticFiles
 from peft import PeftModel
+from pydantic import BaseModel, Field
 from transformers import AutoConfig, AutoModel, AutoTokenizer, BitsAndBytesConfig
 
+from services.job_manager import JobManager
 from utils.process_unlimitedOCR2 import convert as convert_to_markdown
 
-app = FastAPI(title="Unlimited-OCR-2 Parser", version="1.0.0")
+# ---------------------------------------------------------
+# App Initialization & Security Configuration
+# ---------------------------------------------------------
+app = FastAPI(
+    title="Indic OCR Microservice",
+    description="Production-grade REST & Async Microservice for Indic Document OCR (Baidu Unlimited-OCR-2).",
+    version="2.0.0",
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -51,18 +75,51 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Output directory for processed web results
-RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs", "web_results")
+# Output directory for processed web results & jobs
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+RESULTS_DIR = os.path.join(BASE_DIR, "outputs", "web_results")
+JOBS_DIR = os.path.join(BASE_DIR, "outputs", "jobs")
 os.makedirs(RESULTS_DIR, exist_ok=True)
+os.makedirs(JOBS_DIR, exist_ok=True)
+
 app.mount("/results", StaticFiles(directory=RESULTS_DIR), name="results")
 
-# Global model state
+JOB_MANAGER = JobManager(storage_dir=JOBS_DIR)
+
+# Optional API Security Key (Set via env var: API_SECRET_KEY)
+API_SECRET_KEY = os.environ.get("API_SECRET_KEY", "").strip()
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+async def verify_api_key(
+    header_key: Optional[str] = Security(api_key_header),
+    auth_header: Optional[str] = Header(None, alias="Authorization"),
+):
+    """Verify API authentication if API_SECRET_KEY is configured in the environment."""
+    if not API_SECRET_KEY:
+        return True  # Auth is disabled by default for zero-friction local setups
+
+    token = header_key
+    if not token and auth_header and auth_header.startswith("Bearer "):
+        token = auth_header.split(" ", 1)[1].strip()
+
+    if token != API_SECRET_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing API Key. Provide via 'X-API-Key' or 'Authorization: Bearer <key>'.",
+        )
+    return True
+
+
+# ---------------------------------------------------------
+# Global Model State & Preloading
+# ---------------------------------------------------------
 MODEL_LOCK = asyncio.Lock()
 MODEL = None
 TOKENIZER = None
 CURRENT_LORA_PATH = None
 BASE_MODEL_NAME = "baidu/Unlimited-OCR-2"
-DEFAULT_LORA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs", "unlimited-ocr2-indic-lora")
+DEFAULT_LORA_PATH = os.path.join(BASE_DIR, "outputs", "unlimited-ocr2-indic-lora")
 
 
 def load_model_if_needed(lora_path: Optional[str] = DEFAULT_LORA_PATH):
@@ -107,6 +164,9 @@ def load_model_if_needed(lora_path: Optional[str] = DEFAULT_LORA_PATH):
     print("[INFO] Model loaded and ready for inference!")
 
 
+# ---------------------------------------------------------
+# Utility Helper Functions
+# ---------------------------------------------------------
 def parse_page_selection(range_str: str, total_pages: int) -> List[int]:
     """Parse string like '1', '1-3', '1, 3, 5', 'all' into 0-indexed page list."""
     if not range_str or range_str.strip().lower() == "all":
@@ -144,38 +204,346 @@ def pdf_to_images(pdf_bytes: bytes, page_indices: Optional[List[int]] = None, dp
     return image_paths
 
 
+def execute_ocr_pipeline(
+    file_path: str,
+    output_dir: str,
+    pages_str: str = "1",
+    fast_mode: bool = True,
+    max_tokens: int = 2048,
+    no_repeat_ngram_size: int = 15,
+    temperature: float = 0.0,
+    checkpoint: str = "latest",
+    progress_callback=None,
+) -> Dict[str, Any]:
+    """Core synchronous execution of document parsing across selected pages."""
+    target_lora = DEFAULT_LORA_PATH
+    if checkpoint and checkpoint != "latest":
+        custom_path = os.path.join(DEFAULT_LORA_PATH, checkpoint)
+        if os.path.exists(custom_path):
+            target_lora = custom_path
+
+    load_model_if_needed(target_lora)
+
+    with open(file_path, "rb") as f:
+        content = f.read()
+
+    filename = os.path.basename(file_path).lower()
+    temp_image_paths = []
+    selected_page_numbers = []
+
+    if filename.endswith(".pdf"):
+        doc_temp = fitz.open(stream=content, filetype="pdf")
+        total_doc_pages = len(doc_temp)
+        doc_temp.close()
+
+        target_indices = parse_page_selection(pages_str, total_doc_pages)
+        selected_page_numbers = [i + 1 for i in target_indices]
+        temp_image_paths = pdf_to_images(content, page_indices=target_indices)
+        if not temp_image_paths:
+            raise RuntimeError("Unable to extract pages from PDF.")
+    else:
+        temp_image_paths = [file_path]
+        selected_page_numbers = [1]
+
+    total_pages = len(temp_image_paths)
+    use_crops = not fast_mode
+    t_start = time.time()
+
+    page_mds = []
+    page_raws = []
+    annotated_box_imgs = []
+
+    for idx, img_path in enumerate(temp_image_paths):
+        p_num = selected_page_numbers[idx]
+        page_out_dir = output_dir if total_pages == 1 else os.path.join(output_dir, f"page_{p_num}")
+        os.makedirs(page_out_dir, exist_ok=True)
+
+        if progress_callback:
+            progress_callback(idx + 1, total_pages)
+
+        p_raw = MODEL.infer(
+            TOKENIZER,
+            image_file=img_path,
+            output_path=page_out_dir,
+            save_results=True,
+            max_new_tokens=max_tokens,
+            no_repeat_ngram_size=no_repeat_ngram_size,
+            temperature=temperature,
+            eval_mode=True,
+            crop_mode=use_crops,
+            tps_interval=25,
+        )
+        page_raws.append(p_raw)
+
+        try:
+            p_md = convert_to_markdown(p_raw)
+        except Exception:
+            p_md = p_raw
+
+        if total_pages > 1:
+            page_mds.append(f"### 📄 Page {p_num}\n\n{p_md}")
+        else:
+            page_mds.append(p_md)
+
+        box_filename = "result_with_boxes_0.jpg"
+        box_path = os.path.join(page_out_dir, box_filename)
+        if os.path.exists(box_path):
+            rel_url = f"/results/{os.path.basename(output_dir)}/{box_filename}" if total_pages == 1 else f"/results/{os.path.basename(output_dir)}/page_{p_num}/{box_filename}"
+            annotated_box_imgs.append(rel_url)
+
+    latency = round(time.time() - t_start, 2)
+    raw_text = "\n\n<PAGE>\n\n".join(page_raws)
+    md_text = "\n\n---\n\n".join(page_mds)
+
+    with open(os.path.join(output_dir, "result.md"), "w", encoding="utf-8") as f:
+        f.write(md_text)
+    with open(os.path.join(output_dir, "result_raw.md"), "w", encoding="utf-8") as f:
+        f.write(raw_text)
+
+    # Clean up PDF temp images
+    if filename.endswith(".pdf") and temp_image_paths:
+        tmp_parent = os.path.dirname(temp_image_paths[0])
+        shutil.rmtree(tmp_parent, ignore_errors=True)
+
+    token_count = len(TOKENIZER.encode(raw_text, add_special_tokens=False)) if TOKENIZER else 0
+    tok_per_sec = round(token_count / max(0.1, latency), 1)
+
+    return {
+        "filename": filename,
+        "pages_parsed": total_pages,
+        "selected_pages": selected_page_numbers,
+        "latency_sec": latency,
+        "tokens": token_count,
+        "tokens_per_sec": tok_per_sec,
+        "markdown": md_text,
+        "raw_layout": raw_text,
+        "annotated_image_url": annotated_box_imgs[0] if annotated_box_imgs else None,
+        "annotated_image_urls": annotated_box_imgs,
+    }
+
+
+# ---------------------------------------------------------
+# Background Worker Task
+# ---------------------------------------------------------
+async def background_gpu_worker():
+    """Consumes async jobs from queue one-by-one under MODEL_LOCK."""
+    print("[INFO] Async GPU Worker started. Listening for parsing jobs...")
+    while True:
+        job_id = await JOB_MANAGER.queue.get()
+        job = JOB_MANAGER.get_job(job_id)
+        if not job or job["status"] != "queued":
+            JOB_MANAGER.queue.task_done()
+            continue
+
+        params = job["parameters"]
+        req_out_dir = os.path.join(RESULTS_DIR, job_id)
+        os.makedirs(req_out_dir, exist_ok=True)
+
+        print(f"[INFO] Processing background job {job_id} ({params['filename']})...")
+        try:
+            async with MODEL_LOCK:
+                result = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    execute_ocr_pipeline,
+                    params["input_file_path"],
+                    req_out_dir,
+                    params.get("pages", "1"),
+                    params.get("fast_mode", True),
+                    params.get("max_tokens", 2048),
+                    params.get("no_repeat_ngram_size", 15),
+                    params.get("temperature", 0.0),
+                    params.get("checkpoint", "latest"),
+                    lambda curr, tot: JOB_MANAGER.update_progress(job_id, curr, tot),
+                )
+            JOB_MANAGER.mark_completed(job_id, result)
+            print(f"[INFO] Background job {job_id} completed successfully in {result['latency_sec']}s.")
+        except Exception as e:
+            print(f"[ERROR] Background job {job_id} failed: {e}")
+            JOB_MANAGER.mark_failed(job_id, str(e))
+        finally:
+            JOB_MANAGER.queue.task_done()
+
+
 @app.on_event("startup")
 async def startup_event():
-    # Preload the default final fine-tuned model
+    # Preload the default fine-tuned model on server boot
     try:
         load_model_if_needed(DEFAULT_LORA_PATH)
     except Exception as e:
         print(f"[WARNING] Preloading model on startup failed: {e}. Will retry on first request.")
 
+    # Launch background GPU queue worker
+    asyncio.create_task(background_gpu_worker())
 
-@app.get("/", response_class=HTMLResponse)
+
+# ---------------------------------------------------------
+# Microservice Endpoints (v1 & Health)
+# ---------------------------------------------------------
+@app.get("/healthz", tags=["Observability"])
+async def health_check():
+    """Liveness probe reporting GPU health, VRAM utilization, and model state."""
+    vram_used = 0.0
+    vram_total = 0.0
+    gpu_name = "CPU"
+    if torch.cuda.is_available():
+        vram_used = round(torch.cuda.memory_allocated() / (1024 ** 3), 2)
+        vram_total = round(torch.cuda.get_device_properties(0).total_memory / (1024 ** 3), 2)
+        gpu_name = torch.cuda.get_device_name(0)
+
+    return {
+        "status": "healthy",
+        "model_loaded": MODEL is not None,
+        "gpu_name": gpu_name,
+        "vram_used_gb": vram_used,
+        "vram_total_gb": vram_total,
+        "active_queue_size": JOB_MANAGER.queue.qsize(),
+        "total_jobs_tracked": len(JOB_MANAGER.jobs),
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+    }
+
+
+@app.get("/v1/models", tags=["Microservice API"], dependencies=[Depends(verify_api_key)])
+async def list_models():
+    """List available model checkpoints and fine-tuned adapters."""
+    available = []
+    if os.path.exists(DEFAULT_LORA_PATH):
+        available.append({"id": "latest", "name": "Final Production (3-Epoch Fine-Tuned)", "path": DEFAULT_LORA_PATH})
+        for item in sorted(os.listdir(DEFAULT_LORA_PATH)):
+            full_p = os.path.join(DEFAULT_LORA_PATH, item)
+            if os.path.isdir(full_p) and item.startswith("checkpoint-"):
+                available.append({"id": item, "name": f"Checkpoint ({item})", "path": full_p})
+    return {"current_model": CURRENT_LORA_PATH, "checkpoints": available}
+
+
+@app.post("/v1/parse", tags=["Microservice API"], dependencies=[Depends(verify_api_key)])
+async def parse_sync(
+    file: UploadFile = File(...),
+    pages: str = Form("1"),
+    fast_mode: bool = Form(True),
+    max_tokens: int = Form(2048),
+    no_repeat_ngram_size: int = Form(15),
+    temperature: float = Form(0.0),
+    checkpoint: Optional[str] = Form("latest"),
+):
+    """Synchronous parsing endpoint. Processes document and returns result directly."""
+    request_id = str(uuid.uuid4())[:8]
+    req_out_dir = os.path.join(RESULTS_DIR, request_id)
+    os.makedirs(req_out_dir, exist_ok=True)
+
+    content = await file.read()
+    filename = file.filename.lower() if file.filename else "upload.jpg"
+    orig_save_path = os.path.join(req_out_dir, f"original_{filename}")
+    with open(orig_save_path, "wb") as f:
+        f.write(content)
+
+    async with MODEL_LOCK:
+        try:
+            result = await asyncio.get_event_loop().run_in_executor(
+                None,
+                execute_ocr_pipeline,
+                orig_save_path,
+                req_out_dir,
+                pages,
+                fast_mode,
+                max_tokens,
+                no_repeat_ngram_size,
+                temperature,
+                checkpoint or "latest",
+            )
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Inference error: {str(e)}")
+
+    return {
+        "success": True,
+        "request_id": request_id,
+        **result,
+    }
+
+
+@app.post("/v1/jobs", tags=["Microservice API"], dependencies=[Depends(verify_api_key)])
+async def submit_async_job(
+    file: UploadFile = File(...),
+    pages: str = Form("1"),
+    fast_mode: bool = Form(True),
+    max_tokens: int = Form(2048),
+    no_repeat_ngram_size: int = Form(15),
+    temperature: float = Form(0.0),
+    checkpoint: Optional[str] = Form("latest"),
+    callback_url: Optional[str] = Form(None),
+):
+    """Asynchronous job submission. Enqueues document for GPU worker and returns job_id immediately."""
+    job_id = f"job_{uuid.uuid4().hex[:10]}"
+    req_out_dir = os.path.join(RESULTS_DIR, job_id)
+    os.makedirs(req_out_dir, exist_ok=True)
+
+    content = await file.read()
+    filename = file.filename.lower() if file.filename else "upload.jpg"
+    orig_save_path = os.path.join(req_out_dir, f"original_{filename}")
+    with open(orig_save_path, "wb") as f:
+        f.write(content)
+
+    job = JOB_MANAGER.create_job(
+        job_id=job_id,
+        filename=filename,
+        input_file_path=orig_save_path,
+        pages=pages,
+        fast_mode=fast_mode,
+        max_tokens=max_tokens,
+        no_repeat_ngram_size=no_repeat_ngram_size,
+        temperature=temperature,
+        checkpoint=checkpoint or "latest",
+        callback_url=callback_url,
+    )
+
+    return {
+        "success": True,
+        "job_id": job_id,
+        "status": job["status"],
+        "created_at": job["created_at"],
+        "queue_position": JOB_MANAGER.queue.qsize(),
+    }
+
+
+@app.get("/v1/jobs/{job_id}", tags=["Microservice API"], dependencies=[Depends(verify_api_key)])
+async def get_job_status(job_id: str):
+    """Retrieve the status, progress, and results of an asynchronous parsing job."""
+    job = JOB_MANAGER.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found.")
+    return job
+
+
+@app.get("/v1/jobs", tags=["Microservice API"], dependencies=[Depends(verify_api_key)])
+async def list_jobs(limit: int = Query(50, ge=1, le=200)):
+    """List recently submitted jobs."""
+    return {"jobs": JOB_MANAGER.list_jobs(limit=limit)}
+
+
+# ---------------------------------------------------------
+# Web UI & Backward-Compatibility Routes
+# ---------------------------------------------------------
+@app.get("/", response_class=HTMLResponse, tags=["Web Studio"])
 async def serve_ui():
-    html_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates", "index.html")
+    html_file = os.path.join(BASE_DIR, "templates", "index.html")
     if os.path.exists(html_file):
         with open(html_file, "r", encoding="utf-8") as f:
             return f.read()
     return "<h1>Unlimited-OCR UI is loading...</h1>"
 
 
-@app.get("/api/status")
-async def get_status():
-    vram_used = 0
-    vram_total = 0
+@app.get("/api/status", tags=["Web Studio"])
+async def get_web_status():
+    vram_used = 0.0
+    vram_total = 0.0
     if torch.cuda.is_available():
         vram_used = round(torch.cuda.memory_allocated() / (1024 ** 3), 2)
         vram_total = round(torch.cuda.get_device_properties(0).total_memory / (1024 ** 3), 2)
 
     available_checkpoints = []
-    base_out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs", "unlimited-ocr2-indic-lora")
-    if os.path.exists(base_out):
-        available_checkpoints.append({"id": "latest", "name": "Final Production (3-Epoch Fine-Tuned)", "path": base_out})
-        for item in sorted(os.listdir(base_out)):
-            full_p = os.path.join(base_out, item)
+    if os.path.exists(DEFAULT_LORA_PATH):
+        available_checkpoints.append({"id": "latest", "name": "Final Production (3-Epoch Fine-Tuned)", "path": DEFAULT_LORA_PATH})
+        for item in sorted(os.listdir(DEFAULT_LORA_PATH)):
+            full_p = os.path.join(DEFAULT_LORA_PATH, item)
             if os.path.isdir(full_p) and item.startswith("checkpoint-"):
                 available_checkpoints.append({"id": item, "name": f"Checkpoint ({item})", "path": full_p})
 
@@ -189,8 +557,8 @@ async def get_status():
     }
 
 
-@app.post("/api/parse")
-async def parse_document(
+@app.post("/api/parse", tags=["Web Studio"])
+async def web_parse(
     file: UploadFile = File(...),
     pages: str = Form("1"),
     max_tokens: int = Form(2048),
@@ -199,124 +567,16 @@ async def parse_document(
     checkpoint: Optional[str] = Form("latest"),
     fast_mode: bool = Form(True),
 ):
-    request_id = str(uuid.uuid4())[:8]
-    req_out_dir = os.path.join(RESULTS_DIR, request_id)
-    os.makedirs(req_out_dir, exist_ok=True)
-
-    content = await file.read()
-    filename = file.filename.lower() if file.filename else "upload.jpg"
-
-    # Save original uploaded file
-    orig_save_path = os.path.join(req_out_dir, f"original_{filename}")
-    with open(orig_save_path, "wb") as f:
-        f.write(content)
-
-    temp_image_paths = []
-    selected_page_numbers = []
-    if filename.endswith(".pdf"):
-        doc_temp = fitz.open(stream=content, filetype="pdf")
-        total_doc_pages = len(doc_temp)
-        doc_temp.close()
-
-        target_indices = parse_page_selection(pages, total_doc_pages)
-        selected_page_numbers = [i + 1 for i in target_indices]
-        temp_image_paths = pdf_to_images(content, page_indices=target_indices)
-        if not temp_image_paths:
-            raise HTTPException(status_code=400, detail="Unable to extract requested pages from PDF.")
-    else:
-        temp_image_paths = [orig_save_path]
-        selected_page_numbers = [1]
-
-    async with MODEL_LOCK:
-        target_lora = DEFAULT_LORA_PATH
-        if checkpoint and checkpoint != "latest":
-            custom_path = os.path.join(DEFAULT_LORA_PATH, checkpoint)
-            if os.path.exists(custom_path):
-                target_lora = custom_path
-
-        load_model_if_needed(target_lora)
-
-        t_start = time.time()
-        use_crops = not fast_mode
-        print(f"[INFO] Processing request (pages={selected_page_numbers}, fast_mode={fast_mode}, crop_mode={use_crops})...")
-        
-        page_mds = []
-        page_raws = []
-        annotated_box_imgs = []
-
-        try:
-            for idx, img_path in enumerate(temp_image_paths):
-                p_num = selected_page_numbers[idx]
-                page_out_dir = req_out_dir if len(temp_image_paths) == 1 else os.path.join(req_out_dir, f"page_{p_num}")
-                os.makedirs(page_out_dir, exist_ok=True)
-                print(f"[INFO] Running inference on page {p_num} ({idx + 1}/{len(temp_image_paths)})...")
-
-                p_raw = MODEL.infer(
-                    TOKENIZER,
-                    image_file=img_path,
-                    output_path=page_out_dir,
-                    save_results=True,
-                    max_new_tokens=max_tokens,
-                    no_repeat_ngram_size=no_repeat_ngram_size,
-                    temperature=temperature,
-                    eval_mode=True,
-                    crop_mode=use_crops,
-                    tps_interval=25,
-                )
-                page_raws.append(p_raw)
-
-                try:
-                    p_md = convert_to_markdown(p_raw)
-                except Exception:
-                    p_md = p_raw
-
-                if len(temp_image_paths) > 1:
-                    page_mds.append(f"### 📄 Page {p_num}\n\n{p_md}")
-                else:
-                    page_mds.append(p_md)
-
-                box_filename = "result_with_boxes_0.jpg"
-                box_path = os.path.join(page_out_dir, box_filename)
-                if os.path.exists(box_path):
-                    rel_url = f"/results/{request_id}/{box_filename}" if len(temp_image_paths) == 1 else f"/results/{request_id}/page_{p_num}/{box_filename}"
-                    annotated_box_imgs.append(rel_url)
-
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Inference error: {str(e)}")
-
-        latency = round(time.time() - t_start, 2)
-
-    raw_text = "\n\n<PAGE>\n\n".join(page_raws)
-    md_text = "\n\n---\n\n".join(page_mds)
-
-    # Persist markdown results
-    with open(os.path.join(req_out_dir, "result.md"), "w", encoding="utf-8") as f:
-        f.write(md_text)
-    with open(os.path.join(req_out_dir, "result_raw.md"), "w", encoding="utf-8") as f:
-        f.write(raw_text)
-
-    # Clean up PDF temp images if created
-    if filename.endswith(".pdf") and temp_image_paths:
-        tmp_parent = os.path.dirname(temp_image_paths[0])
-        shutil.rmtree(tmp_parent, ignore_errors=True)
-
-    token_count = len(TOKENIZER.encode(raw_text, add_special_tokens=False)) if TOKENIZER else 0
-    tok_per_sec = round(token_count / max(0.1, latency), 1)
-
-    return {
-        "success": True,
-        "request_id": request_id,
-        "filename": file.filename,
-        "pages_parsed": len(temp_image_paths),
-        "selected_pages": selected_page_numbers,
-        "latency_sec": latency,
-        "tokens": token_count,
-        "tokens_per_sec": tok_per_sec,
-        "markdown": md_text,
-        "raw_layout": raw_text,
-        "annotated_image_url": annotated_box_imgs[0] if annotated_box_imgs else None,
-        "annotated_image_urls": annotated_box_imgs,
-    }
+    """Handler for the interactive Web Studio UI."""
+    return await parse_sync(
+        file=file,
+        pages=pages,
+        fast_mode=fast_mode,
+        max_tokens=max_tokens,
+        no_repeat_ngram_size=no_repeat_ngram_size,
+        temperature=temperature,
+        checkpoint=checkpoint,
+    )
 
 
 if __name__ == "__main__":

@@ -223,15 +223,87 @@ Open **[http://localhost:8000](http://localhost:8000)** in your browser.
 
 #### Features
 1. **Drag-and-Drop Document Uploader**: Supports PDF (single or multi-page), PNG, JPG, and WEBP.
-2. **Three-Way Output Inspection**:
+2. **Sequential Page-by-Page Pipeline**: Clean coordinate space for each page, supporting multi-page booklets and books without token repetition.
+3. **⚡ Fast Mode**: Runs standard documents in ~15–20s (273 tokens) or switch to 🔍 Ultra-HD Crop for fine-print manuscripts (1,513 tokens).
+4. **Three-Way Output Inspection**:
    * **📄 Rendered Markdown**: Formatted headings, tables, and paragraphs with one-click **Copy** and **Download `.md`**.
    * **🎯 Visual Bounding Boxes**: Displays color-coded bounding boxes drawn over detected titles, paragraphs, and tables.
    * **🏷️ Raw Layout Tokens**: Shows the underlying `<PAGE><BLOCK>...<FORK>` syntax.
-3. **Model Configuration**: Select between the final 3-epoch production model or intermediate checkpoints (`checkpoint-300`, `checkpoint-250`), with adjustable anti-repetition N-gram penalty and max token sliders.
 
 ---
 
-### 6. Running Local CLI Inference (`local_infer.py`)
+### 6. Production Microservice API & Client SDK
+
+The backend functions as a standalone **REST & Asynchronous Task Microservice** designed for cross-project integration.
+
+#### A. Microservice Endpoints
+
+| Method | Endpoint | Description |
+| :--- | :--- | :--- |
+| `GET` | `/healthz` | Liveness & GPU readiness probe (VRAM used/total, active queue size) |
+| `GET` | `/v1/models` | List available model checkpoints and adapters |
+| `POST` | `/v1/parse` | **Synchronous OCR**: Processes file and returns Markdown + boxes directly |
+| `POST` | `/v1/jobs` | **Asynchronous Job**: Enqueues file, returns `job_id` in <100ms, supports webhook callbacks |
+| `GET` | `/v1/jobs/{id}` | Query job status, progress percentage, and parsed results |
+| `GET` | `/v1/jobs` | List recent jobs |
+
+#### B. Using in Another Project (Python Client SDK)
+
+Drop `client/indic_ocr.py` into any other repository, or import it directly:
+
+```python
+from client import IndicOCRClient
+
+# Initialize client
+client = IndicOCRClient(base_url="http://localhost:8000")
+
+# Option 1: Synchronous parse (ideal for single images or 1-page receipts)
+result = client.parse("document.pdf", pages="1", fast_mode=True)
+print(result.markdown)
+result.save_markdown("output.md")
+
+# Option 2: Asynchronous task pipeline (ideal for multi-page documents)
+job = client.submit_job("booklet.pdf", pages="1-5", fast_mode=True)
+print(f"Submitted job: {job.job_id}")
+
+# Wait for completion (polls automatically)
+completed = job.wait(poll_interval=2.0)
+print(f"Completed in {completed.latency_sec}s!")
+print(completed.markdown)
+```
+
+#### C. Using via cURL / REST API
+
+```bash
+# 1. Check Service & GPU Health
+curl http://localhost:8000/healthz
+
+# 2. Synchronous Document Parsing
+curl -X POST http://localhost:8000/v1/parse \
+  -F "file=@document.pdf" \
+  -F "pages=1" \
+  -F "fast_mode=true"
+
+# 3. Asynchronous Job Submission
+curl -X POST http://localhost:8000/v1/jobs \
+  -F "file=@sample.pdf" \
+  -F "pages=1-3" \
+  -F "callback_url=https://your-app.com/api/ocr-webhook"
+
+# 4. Check Job Status
+curl http://localhost:8000/v1/jobs/job_9f4b12c8
+```
+
+#### D. Security / API Authentication
+To protect your GPU compute in production, set the environment variable:
+```bash
+export API_SECRET_KEY="your-secret-api-token"
+```
+When set, the microservice automatically requires the `X-API-Key` or `Authorization: Bearer <key>` header on all `/v1/*` requests.
+
+---
+
+### 7. Running Local CLI Inference (`local_infer.py`)
 
 `local_infer.py` runs `baidu/Unlimited-OCR-2` directly on Windows via Hugging Face `transformers` (with 4-bit quantization enabled by default for 6 GB VRAM) and automatically converts the raw `<PAGE><BLOCK>...<FORK>` output into clean Markdown using `utils/process_unlimitedOCR2.py`.
 

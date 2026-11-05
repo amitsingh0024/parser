@@ -35,3 +35,4 @@ log/
 Thumbs.db
 .vscode/
 .idea/
+.venv-wsl/
