@@ -193,7 +193,6 @@ async def parse_document(
         load_model_if_needed(target_lora)
 
         t_start = time.time()
-        try:
         use_crops = not fast_mode
         print(f"[INFO] Processing request (fast_mode={fast_mode}, crop_mode={use_crops})...")
         try:
