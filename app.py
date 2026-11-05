@@ -84,10 +84,32 @@ os.makedirs(JOBS_DIR, exist_ok=True)
 
 app.mount("/results", StaticFiles(directory=RESULTS_DIR), name="results")
 
+# Automatically load .env file if present in BASE_DIR
+env_file_path = os.path.join(BASE_DIR, ".env")
+if os.path.exists(env_file_path):
+    try:
+        with open(env_file_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    k = k.strip()
+                    v = v.strip().strip("'\"")
+                    if k and k not in os.environ:
+                        os.environ[k] = v
+        print("[INFO] Successfully loaded environment settings from .env")
+    except Exception as e:
+        print(f"[WARNING] Could not load .env file: {e}")
+
 JOB_MANAGER = JobManager(storage_dir=JOBS_DIR)
 
-# Optional API Security Key (Set via env var: API_SECRET_KEY)
+# Optional API Security Key (Set via env var: API_SECRET_KEY or in .env)
 API_SECRET_KEY = os.environ.get("API_SECRET_KEY", "").strip()
+if API_SECRET_KEY:
+    print(f"[INFO] API Authentication is ENABLED (Key: {API_SECRET_KEY[:6]}...{API_SECRET_KEY[-4:]})")
+else:
+    print("[INFO] API Authentication is DISABLED (No API_SECRET_KEY set)")
+
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
