@@ -16,6 +16,17 @@ from typing import List, Optional
 sys.stdout.reconfigure(encoding="utf-8")
 sys.stderr.reconfigure(encoding="utf-8")
 
+# Auto-detect Windows Hugging Face cache when running inside WSL to reuse existing ~15GB weights
+if "HF_HOME" not in os.environ:
+    windows_users_dir = "/mnt/c/Users"
+    if os.path.exists(windows_users_dir):
+        for user in os.listdir(windows_users_dir):
+            candidate = os.path.join(windows_users_dir, user, ".cache", "huggingface")
+            if os.path.isdir(os.path.join(candidate, "hub")):
+                os.environ["HF_HOME"] = candidate
+                print(f"[INFO] WSL Auto-detected Windows Hugging Face cache at {candidate}")
+                break
+
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
