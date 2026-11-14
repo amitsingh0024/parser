@@ -8,15 +8,19 @@ from typing import Any, Dict, List, Optional
 
 
 class JobManager:
-    """Manages asynchronous OCR parsing jobs with persistent state and background GPU queuing."""
+    """Manages asynchronous OCR parsing jobs and batch workflows with persistent state and background GPU queuing."""
 
     def __init__(self, storage_dir: str):
         self.storage_dir = storage_dir
+        self.batches_dir = os.path.join(storage_dir, "batches")
         os.makedirs(self.storage_dir, exist_ok=True)
+        os.makedirs(self.batches_dir, exist_ok=True)
         self.queue: asyncio.Queue = asyncio.Queue()
         self.jobs: Dict[str, Dict[str, Any]] = {}
+        self.batches: Dict[str, Dict[str, Any]] = {}
         self._worker_task: Optional[asyncio.Task] = None
         self._load_existing_jobs()
+        self._load_existing_batches()
 
     def _load_existing_jobs(self):
         try:
@@ -29,6 +33,17 @@ class JobManager:
         except Exception as e:
             print(f"[WARNING] Could not load existing jobs from disk: {e}")
 
+    def _load_existing_batches(self):
+        try:
+            for fname in os.listdir(self.batches_dir):
+                if fname.endswith(".json"):
+                    fpath = os.path.join(self.batches_dir, fname)
+                    with open(fpath, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                        self.batches[data["batch_id"]] = data
+        except Exception as e:
+            print(f"[WARNING] Could not load existing batches from disk: {e}")
+
     def _save_job_to_disk(self, job_id: str):
         try:
             job_data = self.jobs.get(job_id)
@@ -39,6 +54,16 @@ class JobManager:
         except Exception as e:
             print(f"[WARNING] Failed to persist job {job_id} to disk: {e}")
 
+    def _save_batch_to_disk(self, batch_id: str):
+        try:
+            batch_data = self.batches.get(batch_id)
+            if batch_data:
+                fpath = os.path.join(self.batches_dir, f"{batch_id}.json")
+                with open(fpath, "w", encoding="utf-8") as f:
+                    json.dump(batch_data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"[WARNING] Failed to persist batch {batch_id} to disk: {e}")
+
     def create_job(
         self,
         job_id: str,
@@ -46,14 +71,17 @@ class JobManager:
         input_file_path: str,
         pages: str = "1",
         fast_mode: bool = True,
-        max_tokens: int = 2048,
-        no_repeat_ngram_size: int = 15,
+        max_tokens: int = 1024,
+        no_repeat_ngram_size: int = 7,
         temperature: float = 0.0,
         checkpoint: str = "latest",
+        script: str = "auto",
         callback_url: Optional[str] = None,
+        batch_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         job = {
             "job_id": job_id,
+            "batch_id": batch_id,
             "status": "queued",
             "created_at": datetime.datetime.utcnow().isoformat() + "Z",
             "started_at": None,
@@ -74,6 +102,7 @@ class JobManager:
                 "no_repeat_ngram_size": no_repeat_ngram_size,
                 "temperature": temperature,
                 "checkpoint": checkpoint,
+                "script": script,
                 "callback_url": callback_url,
             },
             "result": None,
@@ -81,8 +110,76 @@ class JobManager:
         }
         self.jobs[job_id] = job
         self._save_job_to_disk(job_id)
+
+        if batch_id and batch_id in self.batches:
+            self.batches[batch_id]["job_ids"].append(job_id)
+            self._save_batch_to_disk(batch_id)
+
         self.queue.put_nowait(job_id)
         return job
+
+    def create_batch(self, batch_id: str, metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        batch = {
+            "batch_id": batch_id,
+            "created_at": datetime.datetime.utcnow().isoformat() + "Z",
+            "job_ids": [],
+            "metadata": metadata or {},
+        }
+        self.batches[batch_id] = batch
+        self._save_batch_to_disk(batch_id)
+        return batch
+
+    def get_batch(self, batch_id: str) -> Optional[Dict[str, Any]]:
+        batch = self.batches.get(batch_id)
+        if not batch:
+            return None
+        # Aggregate current statuses
+        jobs_status = []
+        completed_count = 0
+        failed_count = 0
+        queued_count = 0
+        processing_count = 0
+
+        for j_id in batch.get("job_ids", []):
+            j = self.jobs.get(j_id)
+            if j:
+                st = j.get("status", "unknown")
+                if st == "completed":
+                    completed_count += 1
+                elif st == "failed":
+                    failed_count += 1
+                elif st == "processing":
+                    processing_count += 1
+                elif st == "queued":
+                    queued_count += 1
+                jobs_status.append({
+                    "job_id": j_id,
+                    "filename": j.get("parameters", {}).get("filename"),
+                    "status": st,
+                    "progress": j.get("progress"),
+                    "error": j.get("error"),
+                    "result_summary": {
+                        "tokens": j["result"].get("tokens") if j.get("result") else None,
+                        "latency_sec": j["result"].get("latency_sec") if j.get("result") else None,
+                        "degenerated": j["result"].get("degenerated", False) if j.get("result") else False,
+                        "confidence": j["result"].get("confidence") if j.get("result") else None,
+                    } if j.get("result") else None,
+                })
+
+        total = len(batch.get("job_ids", []))
+        is_done = total > 0 and (completed_count + failed_count == total)
+
+        return {
+            "batch_id": batch_id,
+            "created_at": batch.get("created_at"),
+            "total_jobs": total,
+            "completed": completed_count,
+            "failed": failed_count,
+            "processing": processing_count,
+            "queued": queued_count,
+            "is_completed": is_done,
+            "jobs": jobs_status,
+        }
 
     def update_progress(self, job_id: str, current_page: int, total_pages: int):
         if job_id in self.jobs:

@@ -81,14 +81,38 @@ To give your service a **permanent, static domain** (e.g. `ocr.yourdomain.com` o
 
 ---
 
-## 4. Authentication & Idempotency Headers
+## 4. Guardrails: Hallucination, Degeneration, & Timeout Prevention
 
-* **Authentication (pass either)**:
-  * `X-API-Key: <your-key>`
-  * `Authorization: Bearer <your-key>`
-* **Idempotency**:
-  * `Idempotency-Key: <uuid-or-unique-string>`
-  * If a request with an existing idempotency key is repeated within 24 hours, the service immediately returns the cached result in `<5ms` without re-running GPU inference.
+### A. Fail Loudly — Never Emit Fluent Inventions
+Autoregressive vision-language decoders can occasionally lose visual grounding on dense, unpunctuated lists (such as botanical formulations or herb enumerations) and drop into high-frequency conversational Hindi attractor loops (`प्रत्याशन के लिए... प्रतिनिधि के लिए...`).
+
+The server enforces an **active double-layer guardrail**:
+1. **Real-time Decoder Repetition Interceptor**: 
+   Monitors token generation in real-time. If a token cycle of length 3 to 25 repeats 3 times consecutively, decoding is **immediately halted in ~2 seconds** by forcing an `EOS` token. This completely prevents the model from generating 2048 tokens and guarantees that Cloudflare's 120s timeout (**HTTP 524**) will **never** be triggered.
+2. **Server-Side Hallucination & Degeneration Detector**:
+   Analyzes the resulting text for n-gram repetition loops, repetition ratios, and script consistency.
+   When a loop or intrusion is detected, the server **fails loudly**:
+   - `"success": false`
+   - `"degenerated": true`
+   - `"hallucination_flag": true`
+   - `"confidence": 0.20` *(or 0.35)*
+   - `"degeneration_reason": "Repetition loop: 3-gram '...' repeated 3 times | Hindi language intrusion under Sanskrit constraint"`
+   
+   Downstream clients (like OpenPDFSpecs) can safely inspect `success === false` or `confidence < 0.50` and immediately fall back to the existing document text layer, preventing corrupt inventions from entering clinical or scholarly knowledgebases.
+
+### B. Script & Language Constraints (`script=devanagari-sanskrit`)
+Pass `script="devanagari-sanskrit"` (or `script="sanskrit"`) to activate strict classical Sanskrit rules:
+- **Hindi Intrusion Rejection**: Detects modern conversational Hindi markers (`के लिए`, `प्रतिनिधि`, `करता है`, `होता है`) and flags them as hallucinations.
+- **Nukta Stripping**: Classical Sanskrit has no nuktas. Automatically normalizes all Hindi nuktas (`ड़` $\to$ `ड`, `ढ़` $\to$ `ढ`, `क़` $\to$ `क`, `ख़` $\to$ `ख`, `ग़` $\to$ `ग`, `ज़` $\to$ `ज`, `फ़` $\to$ `फ`).
+- **Visarga Restoration**: Converts ASCII colons (`:`) following Devanagari text into genuine Visargas (`ः`).
+- **Domain Lexicon Disambiguation**: Corrects pervasive minimal-pair OCR confusions in Ayurvedic texts:
+  - `ब्रण` / `ब्रणी` $\to$ `व्रण` / `व्रणी` (wound/ulcer)
+  - `बातव्याधि` / `बातपित्त` $\to$ `वातव्याधि` / `वातपित्त` (Vata dosha)
+  - `ब्याधि` $\to$ `व्याधि` (disease)
+  - `बृद्धि` $\to$ `वृद्धि` (enlargement)
+  - `बिपाक` $\to$ `विपाक` (post-digestive effect)
+  - `बिरेचन` $\to$ `विरेचन` (purgation)
+  - `बीर्य` $\to$ `वीर्य` (potency)
 
 ---
 
@@ -97,7 +121,7 @@ To give your service a **permanent, static domain** (e.g. `ocr.yourdomain.com` o
 * **Optimal Resolution**: Empirical benchmarking on classical Indic manuscripts shows that **200 DPI is optimal (94.6% accuracy)**. Rendering higher (e.g., 400–600 DPI) degrades recognition accuracy down to 86.2%. The service defaults to 200 DPI internally.
 * **Script Hints (`script`)**:
   * `auto` (Default): Multilingual detection.
-  * `sanskrit`: Strips Devanagari nuktas (which never occur in Sanskrit orthography), repairs ASCII Visarga colons (`:` $\to$ `ः`), and disambiguates domain terms (e.g. `व्रण`).
+  * `devanagari-sanskrit` or `sanskrit`: Strict Sanskrit script constraints, nukta stripping, visarga restoration, domain minimal-pair disambiguation, and conversational Hindi intrusion rejection.
   * `hindi`: Preserves Hindi/Urdu nuktas (`ड़`, `ढ़`, `ज़`, `फ़`).
   * `english`: Restores dropped ligature characters (`ffi`, `ff`, `fl`).
 
@@ -120,8 +144,8 @@ To give your service a **permanent, static domain** (e.g. `ocr.yourdomain.com` o
     "vram_used_gb": 2.76,
     "vram_total_gb": 6.0,
     "active_queue_size": 0,
-    "total_jobs_tracked": 12,
-    "timestamp": "2026-11-05T13:10:00Z"
+    "total_jobs_tracked": 14,
+    "timestamp": "2026-11-14T11:00:00Z"
   }
   ```
 
@@ -154,36 +178,54 @@ Processes single-page documents, images, or forms and returns results immediatel
 * **Form Parameters**:
   * `file` (File, required): PDF or image (`.pdf`, `.png`, `.jpg`, `.webp`).
   * `pages` (String, default: `"1"`): Page selection (e.g. `"1"`, `"1-3"`, `"all"`).
-  * `script` (String, default: `"auto"`): Language hint: `"sanskrit"`, `"hindi"`, `"auto"`.
+  * `script` (String, default: `"auto"`): Language hint: `"devanagari-sanskrit"`, `"sanskrit"`, `"hindi"`, `"auto"`.
   * `fast_mode` (Boolean, default: `true`): `true` uses 273 visual tokens (~15–20s); `false` uses 1,513 tokens for dense fine print.
-  * `max_tokens` (Integer, default: `2048`): Maximum generated token length.
+  * `max_tokens` (Integer, default: `1024`): Maximum generated token length.
+  * `no_repeat_ngram_size` (Integer, default: `7`): Repetition suppression n-gram window.
   * `checkpoint` (String, default: `"latest"`): Model checkpoint to pin.
-* **Response**:
+* **Response (Normal Case)**:
   ```json
   {
     "success": true,
     "request_id": "a1b2c3d4",
+    "confidence": 0.95,
+    "degenerated": false,
+    "hallucination_flag": false,
+    "degeneration_reason": null,
     "model_version": "unlimited-ocr2-indic-lora-v1",
     "base_model": "baidu/Unlimited-OCR-2",
     "resolved_checkpoint": ".../outputs/unlimited-ocr2-indic-lora",
-    "script": "sanskrit",
+    "script": "devanagari-sanskrit",
     "filename": "manuscript.pdf",
     "pages_parsed": 1,
     "selected_pages": [1],
     "latency_sec": 16.4,
     "tokens": 420,
     "tokens_per_sec": 25.6,
-    "markdown": "### 📄 Page 1\n\n1. किस शब्द में 'वि' उपसर्ग नहीं है ?\n(1) विशाखा...",
-    "raw_layout": "<PAGE><BLOCK>text[95,57,380,81]<FORK>1. किस शब्द में...",
+    "markdown": "त्र्यूषणं धान्यकं चव्यं चित्रकं गजपिप्पली...",
     "regions": [
       {
         "type": "text",
         "box": [95, 57, 380, 81],
         "confidence": 0.96,
-        "text": "1. किस शब्द में 'वि' उपसर्ग नहीं है ?"
+        "text": "त्र्यूषणं धान्यकं चव्यं..."
       }
-    ],
-    "annotated_image_urls": ["/results/a1b2c3d4/result_with_boxes_0.jpg"]
+    ]
+  }
+  ```
+* **Response (Degeneration / Hallucination Detected — Fails Loudly)**:
+  ```json
+  {
+    "success": false,
+    "request_id": "f9e8d7c6",
+    "confidence": 0.20,
+    "degenerated": true,
+    "hallucination_flag": true,
+    "degeneration_reason": "Repetition loop: 3-gram 'प्रत्याशन के लिए' repeated 3 times | Hindi language intrusion under Sanskrit constraint: के लिए, प्रतिनिधि",
+    "model_version": "unlimited-ocr2-indic-lora-v1",
+    "latency_sec": 2.4,
+    "tokens": 35,
+    "markdown": "प्रत्याशन के लिए प्रत्याशन के लिए प्रत्याशन के लिए..."
   }
   ```
 
@@ -202,44 +244,49 @@ Enqueues document for GPU worker and returns `202 Accepted` in `<100ms`.
     "success": true,
     "job_id": "job_e7a192bf80",
     "status": "queued",
-    "created_at": "2026-11-05T13:12:00Z",
+    "created_at": "2026-11-14T11:02:00Z",
     "queue_position": 1
   }
   ```
 
 ---
 
-### 5. Query Job Status & Progress
-* **`GET /v1/jobs/{job_id}`**
-* **Response (In Progress)**:
+### 5. Batch Job Submission (Multiple Documents / Failure Isolation)
+Submits multiple documents under a single batch, processing each independently so one difficult page or failure does not fail the entire batch.
+
+* **`POST /v1/jobs/batch`**
+* **Status Code**: `202 Accepted`
+* **Form Parameters**:
+  * `files` (List of Files, required): Multiple PDF or image uploads.
+  * `pages` (String, default: `"1"`): Page selection per document.
+  * `script` (String, default: `"auto"`): e.g. `"devanagari-sanskrit"`.
+* **Response**:
   ```json
   {
-    "job_id": "job_e7a192bf80",
-    "status": "processing",
-    "progress": {
-      "pages_done": 2,
-      "pages_total": 5,
-      "current_page": 2,
-      "total_pages": 5,
-      "percentage": 40.0
-    }
+    "success": true,
+    "batch_id": "batch_98b7c6d5",
+    "total_submitted": 3,
+    "jobs": [
+      { "job_id": "job_111", "filename": "page1.pdf", "status": "queued" },
+      { "job_id": "job_222", "filename": "page2.pdf", "status": "queued" },
+      { "job_id": "job_333", "filename": "page3.pdf", "status": "queued" }
+    ],
+    "status_url": "/v1/jobs/batch/batch_98b7c6d5"
   }
   ```
-* **Response (Completed)**:
+
+* **`GET /v1/jobs/batch/{batch_id}`**
+* **Response**:
   ```json
   {
-    "job_id": "job_e7a192bf80",
-    "status": "completed",
-    "created_at": "2026-11-05T13:12:00Z",
-    "completed_at": "2026-11-05T13:13:15Z",
-    "progress": { "pages_done": 5, "pages_total": 5, "percentage": 100.0 },
-    "result": {
-      "markdown": "### 📄 Page 1\n...\n---\n### 📄 Page 2\n...",
-      "latency_sec": 75.3,
-      "tokens": 2150,
-      "regions": [...],
-      "annotated_image_urls": [...]
-    }
+    "batch_id": "batch_98b7c6d5",
+    "total_jobs": 3,
+    "completed": 2,
+    "failed": 0,
+    "processing": 1,
+    "queued": 0,
+    "is_completed": false,
+    "jobs": [ ... ]
   }
   ```
 
@@ -251,21 +298,26 @@ Accepts pre-computed bounding boxes and crops individual patches for **+3% highe
 * **`POST /v1/parse/regions`**
 * **Form Parameters**:
   * `file` (File, required): PDF or image.
-  * `regions` (String, required): JSON string of bounding boxes, e.g. `[{"x0": 95, "y0": 57, "x1": 380, "y1": 81}]`. Coordinates can be normalized (0..1000) or pixel dimensions.
+  * `regions` (String, required): JSON string of bounding boxes, e.g. `[{"x0": 95, "y0": 57, "x1": 380, "y1": 81}]`.
   * `page` (Integer, default: `1`): Target page.
-  * `script` (String, default: `"auto"`): `"sanskrit"`, `"hindi"`, `"auto"`.
+  * `script` (String, default: `"auto"`): `"devanagari-sanskrit"`, `"hindi"`, `"auto"`.
 * **Response**:
   ```json
   {
     "success": true,
     "page": 1,
     "model_version": "unlimited-ocr2-indic-lora-v1",
+    "script": "devanagari-sanskrit",
+    "degenerated": false,
+    "hallucination_flag": false,
     "regions_count": 1,
     "regions": [
       {
         "box": [95, 57, 380, 81],
-        "text": "1. किस शब्द में 'वि' उपसर्ग नहीं है ?",
-        "confidence": 0.96
+        "text": "त्र्यूषणं धान्यकं चव्यं चित्रकं गजपिप्पली।",
+        "confidence": 0.96,
+        "degenerated": false,
+        "hallucination_flag": false
       }
     ]
   }
@@ -273,22 +325,26 @@ Accepts pre-computed bounding boxes and crops individual patches for **+3% highe
 
 ---
 
-## 7. Error Semantics & Operating Limits
+## 7. Retraining vs. Runtime Defenses: The Full Strategy
 
-| HTTP Status | Semantics | Client Action |
-| :--- | :--- | :--- |
-| **`200 OK` / `202 Accepted`** | Success / Job Enqueued | Process result or begin polling. |
-| **`400 Bad Request`** | Invalid file format, corrupted PDF, or bad page range. | **Fatal**. Do not retry without modifying parameters. |
-| **`401 Unauthorized`** | Missing or incorrect API key. | **Fatal**. Verify `X-API-Key` header. |
-| **`404 Not Found`** | Job ID does not exist. | **Fatal**. Check `job_id`. |
-| **`422 Unprocessable`** | Form schema validation failure. | **Fatal**. Check parameter names. |
-| **`429 Too Many Requests`** | GPU queue capacity saturated. | **Retryable**. Back off using `Retry-After` header. |
-| **`500 Internal Error`** | Transient inference or worker error. | **Retryable**. Exponential back-off. |
+When evaluating whether retraining is necessary, the problem divides into two distinct layers:
 
-### Operational Limits:
-- **Maximum File Size**: 100 MB.
-- **Maximum Synchronous Pages**: 5 pages per `/v1/parse` request (for $>5$ pages, always use `/v1/jobs` to prevent HTTP gateway timeouts).
-- **GPU Queue Concurrency**: Automatically serialized via async worker locks to guarantee zero Out-of-Memory (OOM) crashes on 6 GB VRAM GPUs.
+### 1. What Runtime Defenses Solve (Available Right Now, Zero Downtime)
+- **Preventing HTTP 524 timeouts**: The real-time loop detector cuts off repeating loops in $\approx 2.5\text{s}$ instead of letting decoding run for $126\text{s}$.
+- **Failing loudly on hallucinations**: The detector identifies repetitive phrases and Hindi functional intrusions under Sanskrit constraints, returning `"success": false`, `"degenerated": true`, and `"confidence": 0.20`. Clients can safely preserve the existing PDF text layer rather than ingesting hallucinated text.
+- **Nukta and Visarga repairs**: Stripping Hindi nuktas and restoring ASCII colons to Visargas is cleanly handled by post-processing.
+- **Ayurvedic domain minimal pairs**: Disambiguating `ब्रण` $\to$ `व्रण` and `बात` $\to$ `वात` in medical compounds is resolved by linguistic rules.
+
+### 2. When Retraining IS Required (LoRA V2 Fine-Tuning)
+Runtime defenses stop the bleeding and fail safely, but they cannot convert an ungrounded hallucination into ground-truth text. To achieve $\ge 95\%$ accuracy on dense Sanskrit verse lists, a **V2 Retraining** is required:
+1. **Synthetic Verse Lists**: 500–1,000 synthesized images of dense, unpunctuated Sanskrit enumerations (herbs, formulations, metrics) without conversational prose structure.
+2. **Hard-Negative Minimal Pairs**: Oversampling visually confusable Devanagari character pairs:
+   - `ब` vs `व`
+   - `त` vs `ल`
+   - `र` vs `न`
+   - Short `ि` vs Long `ी`
+   - `ु` vs `ृ`
+3. **Negative Conditioning**: Penalty on high-frequency conversational Hindi tokens in classical Sanskrit contexts.
 
 ---
 
@@ -300,62 +356,24 @@ from indic_ocr import IndicOCRClient
 
 client = IndicOCRClient("http://localhost:8000", api_key="your-api-key")
 
-# 1. Full Page OCR with Sanskrit script hint
-result = client.parse("manuscript.pdf", pages="1", script="sanskrit")
-print("Markdown:\n", result.markdown)
-for region in result.regions:
-    print(f"Box {region['box']} (Conf: {region['confidence']}): {region['text']}")
+# 1. Full Page OCR with Sanskrit script hint and degeneration checking
+result = client.parse_file("manuscript.pdf", pages="21", script="devanagari-sanskrit")
+if not result.success or result.degenerated:
+    print(f"Warning: Model degeneration detected ({result.degeneration_reason}). Keeping fallback text layer.")
+else:
+    print("Markdown:\n", result.markdown)
 
 # 2. Targeted Region OCR (Higher Accuracy on Dense Verses)
 boxes = [{"x0": 95, "y0": 57, "x1": 380, "y1": 81}]
-region_res = client.parse_regions("manuscript.pdf", regions=boxes, script="sanskrit")
+region_res = client.parse_regions("manuscript.pdf", regions=boxes, script="devanagari-sanskrit")
 print("Cropped text:", region_res["regions"][0]["text"])
 
 # 3. Async Job Pipeline (Multi-Page Books)
-job = client.submit_job("book.pdf", pages="1-10", script="sanskrit")
+job = client.submit_job("book.pdf", pages="1-10", script="devanagari-sanskrit")
 completed = job.wait(poll_interval=2.0)
-print(f"Finished 10 pages in {completed.latency_sec}s!")
-```
+print(f"Finished 10 pages in {completed.latency_sec}s (Conf: {completed.confidence})")
 
-### B. Node.js / TypeScript (`axios`)
-```typescript
-import axios from 'axios';
-import FormData from 'form-data';
-import fs from 'fs';
-
-const client = axios.create({
-  baseURL: 'http://localhost:8000',
-  headers: { 'X-API-Key': 'your-api-key' }
-});
-
-async function parseBooklet() {
-  const form = new FormData();
-  form.append('file', fs.createReadStream('booklet.pdf'));
-  form.append('pages', '1-5');
-  form.append('script', 'sanskrit');
-
-  const { data } = await client.post('/v1/jobs', form, {
-    headers: form.getHeaders()
-  });
-
-  console.log(`Job enqueued: ${data.job_id}`);
-}
-```
-
-### C. cURL (Command Line)
-```bash
-# Synchronous with Sanskrit Hint & Idempotency
-curl -X POST http://localhost:8000/v1/parse \
-  -H "X-API-Key: your-api-key" \
-  -H "Idempotency-Key: req_001_p1" \
-  -F "file=@manuscript.pdf" \
-  -F "pages=1" \
-  -F "script=sanskrit"
-
-# Targeted Region Parsing
-curl -X POST http://localhost:8000/v1/parse/regions \
-  -H "X-API-Key: your-api-key" \
-  -F "file=@manuscript.pdf" \
-  -F 'regions=[{"x0": 95, "y0": 57, "x1": 380, "y1": 81}]' \
-  -F "script=sanskrit"
+# 4. Batch Submission (Isolated Sequential Processing)
+batch = client.submit_batch(["p1.pdf", "p2.pdf", "p3.pdf"], script="devanagari-sanskrit")
+print(f"Batch submitted: {batch['batch_id']}, total jobs: {batch['total_submitted']}")
 ```

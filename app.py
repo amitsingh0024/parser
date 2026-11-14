@@ -60,7 +60,11 @@ from transformers import AutoConfig, AutoModel, AutoTokenizer, BitsAndBytesConfi
 
 from services.job_manager import JobManager
 from utils.process_unlimitedOCR2 import convert as convert_to_markdown
-from utils.script_postprocess import postprocess_text
+from utils.script_postprocess import (
+    postprocess_text,
+    detect_degeneration_and_hallucination,
+    check_token_repetition_loop,
+)
 
 # ---------------------------------------------------------
 # App Initialization & Versioning
@@ -219,6 +223,32 @@ def load_model_if_needed(lora_path: Optional[str] = DEFAULT_LORA_PATH):
     else:
         MODEL = base_model
 
+    # Install real-time repetition guard into model decoding engine to halt runaway loops (resolves HTTP 524)
+    try:
+        mod_name = getattr(base_model.__class__, "__module__", "")
+        mod = sys.modules.get(mod_name)
+        if mod and hasattr(mod, "_uocr_no_repeat_ngram"):
+            if not getattr(mod, "_is_repetition_guarded", False):
+                orig_no_repeat = mod._uocr_no_repeat_ngram
+
+                def guarded_no_repeat_ngram(logits, gen_ids, ngram_size, window_size, whitelist):
+                    # Fast real-time loop detection: if a cycle of 3-25 tokens repeats 3 times, halt!
+                    if len(gen_ids) >= 12:
+                        is_loop, cycle = check_token_repetition_loop(gen_ids, min_cycle=3, max_cycle=25, min_repeats=3)
+                        if is_loop:
+                            eos_id = int(TOKENIZER.eos_token_id) if TOKENIZER else 151643
+                            print(f"\n[REPETITION GUARD] Cycle of length {cycle} repeated 3x at token {len(gen_ids)}. Early-stopping generation to prevent 524 timeout.", flush=True)
+                            logits[:] = -float("inf")
+                            logits[eos_id] = 100.0
+                            return logits
+                    return orig_no_repeat(logits, gen_ids, ngram_size, window_size, whitelist)
+
+                mod._uocr_no_repeat_ngram = guarded_no_repeat_ngram
+                mod._is_repetition_guarded = True
+                print("[INFO] Successfully attached real-time repetition loop guard on decoder.")
+    except Exception as e:
+        print(f"[WARNING] Could not attach decoder repetition guard: {e}")
+
     MODEL.eval()
     CURRENT_LORA_PATH = lora_path
     print("[INFO] Model loaded and ready for inference!")
@@ -299,14 +329,14 @@ def execute_ocr_pipeline(
     output_dir: str,
     pages_str: str = "1",
     fast_mode: bool = True,
-    max_tokens: int = 2048,
-    no_repeat_ngram_size: int = 15,
+    max_tokens: int = 1024,
+    no_repeat_ngram_size: int = 7,
     temperature: float = 0.0,
     checkpoint: str = "latest",
     script_hint: str = "auto",
     progress_callback=None,
 ) -> Dict[str, Any]:
-    """Core synchronous execution of document parsing across selected pages."""
+    """Core synchronous execution of document parsing across selected pages with degeneration monitoring."""
     target_lora = DEFAULT_LORA_PATH
     if checkpoint and checkpoint != "latest":
         custom_path = os.path.join(DEFAULT_LORA_PATH, checkpoint)
@@ -378,7 +408,7 @@ def execute_ocr_pipeline(
         except Exception:
             p_md = p_raw
 
-        # Linguistic postprocessing (Sanskrit nuktas, Visarga colons, English ligatures)
+        # Linguistic postprocessing (Sanskrit nuktas, Visarga colons, English ligatures, Ayurvedic roots)
         p_md = postprocess_text(p_md, script_hint=script_hint)
 
         if total_pages > 1:
@@ -409,7 +439,22 @@ def execute_ocr_pipeline(
     token_count = len(TOKENIZER.encode(raw_text, add_special_tokens=False)) if TOKENIZER else 0
     tok_per_sec = round(token_count / max(0.1, latency), 1)
 
+    # Server-side degeneration & hallucination analysis
+    degen_info = detect_degeneration_and_hallucination(md_text, script_hint=script_hint, token_count=token_count)
+    is_degenerated = degen_info["degenerated"]
+    confidence = degen_info["confidence"]
+    hallucination_flag = degen_info["hallucination_flag"]
+    degen_reason = degen_info["degeneration_reason"]
+
+    # If degeneration detected, adjust region-level confidence
+    if is_degenerated:
+        for r in all_regions:
+            r["confidence"] = min(r.get("confidence", 0.85), confidence)
+            r["degenerated"] = True
+            r["hallucination_flag"] = True
+
     return {
+        "success": not is_degenerated,
         "filename": filename,
         "model_version": MODEL_VERSION,
         "base_model": BASE_MODEL_NAME,
@@ -420,6 +465,12 @@ def execute_ocr_pipeline(
         "latency_sec": latency,
         "tokens": token_count,
         "tokens_per_sec": tok_per_sec,
+        "confidence": confidence,
+        "degenerated": is_degenerated,
+        "hallucination_flag": hallucination_flag,
+        "repetition_ratio": degen_info["repetition_ratio"],
+        "max_repeat_count": degen_info["max_repeat_count"],
+        "degeneration_reason": degen_reason,
         "markdown": md_text,
         "raw_layout": raw_text,
         "regions": all_regions,
@@ -535,8 +586,8 @@ async def parse_sync(
     file: UploadFile = File(...),
     pages: str = Form("1"),
     fast_mode: bool = Form(True),
-    max_tokens: int = Form(2048),
-    no_repeat_ngram_size: int = Form(15),
+    max_tokens: int = Form(1024),
+    no_repeat_ngram_size: int = Form(7),
     temperature: float = Form(0.0),
     checkpoint: Optional[str] = Form("latest"),
     script: Optional[str] = Form("auto"),
@@ -545,6 +596,7 @@ async def parse_sync(
     """
     Synchronous parsing endpoint. Processes document and returns result directly.
     Supports Idempotency-Key header for duplicate-safe calls.
+    Fails loudly with success=false, degenerated=true, and confidence <= 0.35 when loops occur.
     """
     if idempotency_key:
         cached = get_idempotency_result(idempotency_key)
@@ -580,7 +632,6 @@ async def parse_sync(
             raise HTTPException(status_code=500, detail=f"Inference error: {str(e)}")
 
     response_data = {
-        "success": True,
         "request_id": request_id,
         **result,
     }
@@ -596,8 +647,8 @@ async def submit_async_job(
     file: UploadFile = File(...),
     pages: str = Form("1"),
     fast_mode: bool = Form(True),
-    max_tokens: int = Form(2048),
-    no_repeat_ngram_size: int = Form(15),
+    max_tokens: int = Form(1024),
+    no_repeat_ngram_size: int = Form(7),
     temperature: float = Form(0.0),
     checkpoint: Optional[str] = Form("latest"),
     script: Optional[str] = Form("auto"),
@@ -633,6 +684,7 @@ async def submit_async_job(
         no_repeat_ngram_size=no_repeat_ngram_size,
         temperature=temperature,
         checkpoint=checkpoint or "latest",
+        script=script or "auto",
         callback_url=callback_url,
     )
 
@@ -648,6 +700,71 @@ async def submit_async_job(
         save_idempotency_result(idempotency_key, response_data)
 
     return response_data
+
+
+@app.post("/v1/jobs/batch", status_code=status.HTTP_202_ACCEPTED, tags=["Microservice API"], dependencies=[Depends(verify_api_key)])
+async def submit_batch_jobs(
+    files: List[UploadFile] = File(...),
+    pages: str = Form("1"),
+    fast_mode: bool = Form(True),
+    max_tokens: int = Form(1024),
+    no_repeat_ngram_size: int = Form(7),
+    temperature: float = Form(0.0),
+    checkpoint: Optional[str] = Form("latest"),
+    script: Optional[str] = Form("auto"),
+    callback_url: Optional[str] = Form(None),
+):
+    """
+    Batch Job Submission Endpoint. Enqueues multiple documents for sequential GPU processing
+    with per-item failure isolation.
+    """
+    batch_id = f"batch_{uuid.uuid4().hex[:10]}"
+    JOB_MANAGER.create_batch(batch_id, metadata={"total": len(files), "script": script})
+
+    queued_jobs = []
+    for f in files:
+        job_id = f"job_{uuid.uuid4().hex[:10]}"
+        req_out_dir = os.path.join(RESULTS_DIR, job_id)
+        os.makedirs(req_out_dir, exist_ok=True)
+
+        content = await f.read()
+        filename = f.filename.lower() if f.filename else "upload.jpg"
+        orig_save_path = os.path.join(req_out_dir, f"original_{filename}")
+        with open(orig_save_path, "wb") as fp:
+            fp.write(content)
+
+        job = JOB_MANAGER.create_job(
+            job_id=job_id,
+            filename=filename,
+            input_file_path=orig_save_path,
+            pages=pages,
+            fast_mode=fast_mode,
+            max_tokens=max_tokens,
+            no_repeat_ngram_size=no_repeat_ngram_size,
+            temperature=temperature,
+            checkpoint=checkpoint or "latest",
+            script=script or "auto",
+            callback_url=callback_url,
+            batch_id=batch_id,
+        )
+        queued_jobs.append({"job_id": job_id, "filename": filename, "status": "queued"})
+
+    return {
+        "success": True,
+        "batch_id": batch_id,
+        "total_submitted": len(queued_jobs),
+        "jobs": queued_jobs,
+        "status_url": f"/v1/jobs/batch/{batch_id}",
+    }
+
+
+@app.get("/v1/jobs/batch/{batch_id}", tags=["Microservice API"], dependencies=[Depends(verify_api_key)])
+async def get_batch_status(batch_id: str):
+    """Retrieve aggregate progress and individual items for a submitted batch."""
+    b = JOB_MANAGER.get_batch(batch_id)
+    if not b:
+        raise HTTPException(status_code=404, detail=f"Batch {batch_id} not found.")
+    return b
 
 
 @app.get("/v1/jobs/{job_id}", tags=["Microservice API"], dependencies=[Depends(verify_api_key)])
@@ -757,20 +874,29 @@ async def parse_regions(
                 crop_md = raw_crop_text
 
             crop_md = postprocess_text(crop_md, script_hint=script or "auto")
+            region_degen = detect_degeneration_and_hallucination(crop_md, script_hint=script or "auto")
 
             parsed_regions.append({
                 "box": [x0, y0, x1, y1],
                 "text": crop_md,
-                "confidence": 0.96,
+                "confidence": region_degen["confidence"] if region_degen["degenerated"] else 0.96,
+                "degenerated": region_degen["degenerated"],
+                "hallucination_flag": region_degen["hallucination_flag"],
+                "degeneration_reason": region_degen["degeneration_reason"],
             })
 
     shutil.rmtree(tmp_dir, ignore_errors=True)
 
+    has_degeneration = any(r.get("degenerated", False) for r in parsed_regions)
+
     return {
-        "success": True,
+        "success": not has_degeneration,
         "page": page,
         "model_version": MODEL_VERSION,
         "resolved_checkpoint": target_lora,
+        "script": script or "auto",
+        "degenerated": has_degeneration,
+        "hallucination_flag": has_degeneration,
         "regions_count": len(parsed_regions),
         "regions": parsed_regions,
     }

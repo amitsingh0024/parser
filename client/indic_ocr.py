@@ -22,6 +22,12 @@ class ParseResult:
     raw_layout: str
     annotated_image_url: Optional[str]
     annotated_image_urls: List[str]
+    success: bool = True
+    confidence: float = 0.95
+    degenerated: bool = False
+    hallucination_flag: bool = False
+    degeneration_reason: Optional[str] = None
+    script: Optional[str] = None
     model_version: Optional[str] = None
     resolved_checkpoint: Optional[str] = None
     regions: List[Dict[str, Any]] = field(default_factory=list)
@@ -67,6 +73,12 @@ class JobHandle:
                     raw_layout=data.get("raw_layout", ""),
                     annotated_image_url=data.get("annotated_image_url"),
                     annotated_image_urls=data.get("annotated_image_urls", []),
+                    success=data.get("success", not data.get("degenerated", False)),
+                    confidence=data.get("confidence", 0.95),
+                    degenerated=data.get("degenerated", False),
+                    hallucination_flag=data.get("hallucination_flag", False),
+                    degeneration_reason=data.get("degeneration_reason"),
+                    script=data.get("script"),
                     model_version=data.get("model_version"),
                     resolved_checkpoint=data.get("resolved_checkpoint"),
                     regions=data.get("regions", []),
@@ -88,7 +100,7 @@ class IndicOCRClient:
         self.api_key = api_key
 
     def _headers(self, content_type: Optional[str] = None, idempotency_key: Optional[str] = None) -> Dict[str, str]:
-        headers = {"User-Agent": "IndicOCR-Client/2.1"}
+        headers = {"User-Agent": "IndicOCR-Client/2.2"}
         if self.api_key:
             headers["X-API-Key"] = self.api_key
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -98,31 +110,22 @@ class IndicOCRClient:
             headers["Content-Type"] = content_type
         return headers
 
-    def health(self) -> Dict[str, Any]:
-        """Check microservice health, GPU status, model version, and VRAM utilization."""
-        req = urllib.request.Request(f"{self.base_url}/healthz", headers=self._headers())
-        with urllib.request.urlopen(req) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-
-    def models(self) -> List[Dict[str, Any]]:
-        """List available model checkpoints."""
-        req = urllib.request.Request(f"{self.base_url}/v1/models", headers=self._headers())
-        with urllib.request.urlopen(req) as resp:
-            return json.loads(resp.read().decode("utf-8")).get("checkpoints", [])
-
-    def parse(
+    def parse_file(
         self,
         file_path: str,
         pages: str = "1",
         fast_mode: bool = True,
-        max_tokens: int = 2048,
-        no_repeat_ngram_size: int = 15,
+        max_tokens: int = 1024,
+        no_repeat_ngram_size: int = 7,
         temperature: float = 0.0,
         checkpoint: str = "latest",
         script: str = "auto",
         idempotency_key: Optional[str] = None,
     ) -> ParseResult:
-        """Synchronously parse a document (image or PDF) and block until completed."""
+        """
+        Synchronous document parsing with immediate return.
+        Supports script constraints like 'devanagari-sanskrit' and degeneration detection.
+        """
         fields = {
             "pages": pages,
             "fast_mode": "true" if fast_mode else "false",
@@ -153,6 +156,12 @@ class IndicOCRClient:
                 raw_layout=data.get("raw_layout", ""),
                 annotated_image_url=data.get("annotated_image_url"),
                 annotated_image_urls=data.get("annotated_image_urls", []),
+                success=data.get("success", not data.get("degenerated", False)),
+                confidence=data.get("confidence", 0.95),
+                degenerated=data.get("degenerated", False),
+                hallucination_flag=data.get("hallucination_flag", False),
+                degeneration_reason=data.get("degeneration_reason"),
+                script=data.get("script"),
                 model_version=data.get("model_version"),
                 resolved_checkpoint=data.get("resolved_checkpoint"),
                 regions=data.get("regions", []),
@@ -192,8 +201,8 @@ class IndicOCRClient:
         file_path: str,
         pages: str = "1",
         fast_mode: bool = True,
-        max_tokens: int = 2048,
-        no_repeat_ngram_size: int = 15,
+        max_tokens: int = 1024,
+        no_repeat_ngram_size: int = 7,
         temperature: float = 0.0,
         checkpoint: str = "latest",
         script: str = "auto",
@@ -223,6 +232,64 @@ class IndicOCRClient:
         with urllib.request.urlopen(req) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             return JobHandle(self, data["job_id"])
+
+    def submit_batch(
+        self,
+        file_paths: List[str],
+        pages: str = "1",
+        fast_mode: bool = True,
+        max_tokens: int = 1024,
+        no_repeat_ngram_size: int = 7,
+        temperature: float = 0.0,
+        checkpoint: str = "latest",
+        script: str = "auto",
+        callback_url: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Submit multiple files as an isolated sequential batch."""
+        boundary = f"----WebKitFormBoundary{uuid.uuid4().hex}"
+        body = bytearray()
+        fields = {
+            "pages": pages,
+            "fast_mode": "true" if fast_mode else "false",
+            "max_tokens": str(max_tokens),
+            "no_repeat_ngram_size": str(no_repeat_ngram_size),
+            "temperature": str(temperature),
+            "checkpoint": checkpoint,
+            "script": script,
+        }
+        if callback_url:
+            fields["callback_url"] = callback_url
+
+        for k, v in fields.items():
+            body.extend(f"--{boundary}\r\n".encode("utf-8"))
+            body.extend(f'Content-Disposition: form-data; name="{k}"\r\n\r\n'.encode("utf-8"))
+            body.extend(f"{v}\r\n".encode("utf-8"))
+
+        for fp in file_paths:
+            fname = os.path.basename(fp)
+            ctype = mimetypes.guess_type(fname)[0] or "application/octet-stream"
+            body.extend(f"--{boundary}\r\n".encode("utf-8"))
+            body.extend(f'Content-Disposition: form-data; name="files"; filename="{fname}"\r\n'.encode("utf-8"))
+            body.extend(f"Content-Type: {ctype}\r\n\r\n".encode("utf-8"))
+            with open(fp, "rb") as f:
+                body.extend(f.read())
+            body.extend(b"\r\n")
+
+        body.extend(f"--{boundary}--\r\n".encode("utf-8"))
+        req = urllib.request.Request(
+            f"{self.base_url}/v1/jobs/batch",
+            data=bytes(body),
+            headers=self._headers(f"multipart/form-data; boundary={boundary}"),
+            method="POST",
+        )
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def get_batch_status(self, batch_id: str) -> Dict[str, Any]:
+        """Retrieve aggregated progress and item details for a submitted batch."""
+        req = urllib.request.Request(f"{self.base_url}/v1/jobs/batch/{batch_id}", headers=self._headers())
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read().decode("utf-8"))
 
     def get_job_status(self, job_id: str) -> Dict[str, Any]:
         """Fetch raw job metadata and progress."""
